@@ -35,7 +35,7 @@ fn vs_main(
 
     var out: VertexOutput;
     out.tex_coords = model.tex_coords;
-    out.texture_index = 0u;
+    out.texture_index = instance.texture_index;
     out.clip_position = model_matrix * vec4<f32>(model.position, 1.0);
     return out;
 }
