@@ -125,11 +125,16 @@ use image::GenericImageView;
 struct GraphicsProcessor {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    render_pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    instances: Vec<Instance>,
+    instance_buffer: wgpu::Buffer,
+    diffuse_bind_group: wgpu::BindGroup,
 }
 
 impl GraphicsProcessor {
-    pub async fn new() {
-        let _path = Some("./please_don't_git_push_me.png".to_string());
+    pub async fn new() -> GraphicsProcessor {
         let diffuse_bytes = include_bytes!("../assets/targets/grapes.jpg");
         let diffuse_image = image::load_from_memory(diffuse_bytes).unwrap();
         let diffuse_rgba = diffuse_image.to_rgba8();
@@ -139,7 +144,7 @@ impl GraphicsProcessor {
     
         let scale = dimensions.0 as f32 / dimensions.1 as f32;
     
-        let instances = [
+        let instances = vec![
             Instance{
                 position: cgmath::Vector3::new(0.5, 0.0, 0.0),
                 rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(60.0)),
@@ -161,12 +166,7 @@ impl GraphicsProcessor {
             max_texture_array_layers: 2, // Adjust this based on your needs
             ..Default::default()
         };
-    
-    
-    
-        // This will later store the raw pixel value data locally. We'll create it now as
-        // a convenient size reference.
-        let mut texture_data = Vec::<u8>::with_capacity(TEXTURE_DIMS.0 * TEXTURE_DIMS.1 * 4);
+
     
         let instance = wgpu::Instance::default();
         let adapter = instance
@@ -326,28 +326,8 @@ impl GraphicsProcessor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("shader.wgsl"))),
         });
-    
-        let render_target = device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size: wgpu::Extent3d {
-                width: TEXTURE_DIMS.0 as u32,
-                height: TEXTURE_DIMS.1 as u32,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
-        });
-        let output_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: texture_data.capacity() as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-    
+
+
         let render_pipeline_layout =
         device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
@@ -378,13 +358,54 @@ impl GraphicsProcessor {
         });
     
         log::info!("Wgpu context set up.");
+
+        GraphicsProcessor {
+            device,
+            queue,
+            render_pipeline: pipeline,
+            vertex_buffer,
+            index_buffer,
+            instances: instances,
+            instance_buffer: instance_buffer,
+            diffuse_bind_group: diffuse_bind_group,
+        }
+    }
+
+    pub async fn run(&mut self, _path: Option<String>) {
     
         //-----------------------------------------------
     
+        // This will later store the raw pixel value data locally. We'll create it now as
+        // a convenient size reference.
+        let mut texture_data = Vec::<u8>::with_capacity(TEXTURE_DIMS.0 * TEXTURE_DIMS.1 * 4);
+
+        let render_target = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: TEXTURE_DIMS.0 as u32,
+                height: TEXTURE_DIMS.1 as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
+        });
+
+        let output_staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: texture_data.capacity() as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+    
+
         let texture_view = render_target.create_view(&wgpu::TextureViewDescriptor::default());
     
         let mut command_encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -400,17 +421,17 @@ impl GraphicsProcessor {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            render_pass.set_pipeline(&pipeline);
+            render_pass.set_pipeline(&self.render_pipeline);
             //add texture
-            render_pass.set_bind_group(0, &diffuse_bind_group, &[]);
+            render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
             //add vertrices
-            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16); 
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16); 
             // set the instances
-            render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
-            render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
     
-            render_pass.draw_indexed(0..INDICES.len() as u32, 0, 0..instances.len() as u32);
+            render_pass.draw_indexed(0..INDICES.len() as u32, 0, 0..self.instances.len() as u32);
         }
         // The texture now contains our rendered image
         command_encoder.copy_texture_to_buffer(
@@ -436,7 +457,7 @@ impl GraphicsProcessor {
                 depth_or_array_layers: 1,
             },
         );
-        queue.submit(Some(command_encoder.finish()));
+        self.queue.submit(Some(command_encoder.finish()));
         log::info!("Commands submitted.");
     
         //-----------------------------------------------
@@ -445,7 +466,7 @@ impl GraphicsProcessor {
         let buffer_slice = output_staging_buffer.slice(..);
         let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
         buffer_slice.map_async(wgpu::MapMode::Read, move |r| sender.send(r).unwrap());
-        device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::Maintain::Wait);
         receiver.receive().await.unwrap().unwrap();
         log::info!("Output buffer mapped.");
         {
@@ -464,7 +485,8 @@ impl GraphicsProcessor {
 }
 
 async fn run(_path: Option<String>) {
-    pollster::block_on(GraphicsProcessor::new());
+    let mut state = GraphicsProcessor::new().await;
+    state.run(_path).await
 }
 
 fn main() {
