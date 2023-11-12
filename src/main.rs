@@ -1,4 +1,5 @@
 use std::num::NonZeroU32;
+use std::rc::Rc;
 
 #[cfg(not(target_arch = "wasm32"))]
 use genetic_image_creator::wgpu_utils::output_image_native;
@@ -40,10 +41,12 @@ impl Vertex {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
 struct Instance {
     position: cgmath::Vector3<f32>,
     rotation: cgmath::Quaternion<f32>,
     scale: cgmath::Vector3<f32>,
+    texture_index: u32,
 }
 
 impl Instance {
@@ -51,6 +54,16 @@ impl Instance {
 
         InstanceRaw {
             model:(cgmath::Matrix4::from_translation(self.position) * cgmath::Matrix4::from(self.rotation) * cgmath::Matrix4::from_nonuniform_scale(self.scale.x, self.scale.y, self.scale.z) ).into(),
+            texture_index: self.texture_index,
+        }
+    }
+
+    fn new2d(position: cgmath::Vector2<f32>, scale: cgmath::Vector2<f32>, rot: f32, texture_index: u32) -> Instance {
+        Instance {
+            position: cgmath::Vector3::new(position.x, position.y, 0.0),
+            rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(rot)),
+            scale: cgmath::Vector3::new(scale.x, scale.y, 1.0),
+            texture_index: texture_index,
         }
     }
 }
@@ -60,6 +73,7 @@ impl Instance {
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct InstanceRaw {
     model: [[f32; 4]; 4],
+    texture_index: u32,
 }
 
 impl InstanceRaw {
@@ -96,6 +110,12 @@ impl InstanceRaw {
                     shader_location: 8,
                     format: wgpu::VertexFormat::Float32x4,
                 },
+                // The texture index is a u32, so we need to use the Uint32 format
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 16]>() as wgpu::BufferAddress,
+                    shader_location: 9,
+                    format: wgpu::VertexFormat::Uint32,
+                },
             ],
         }
     }
@@ -117,10 +137,7 @@ const INDICES: &[u16] = &[
     0, 1, 3, // second triangle
 ];
 
-const NUM_INSTANCES_PER_ROW: u32 = 2;
-const INSTANCE_DISPLACEMENT: cgmath::Vector3<f32> = cgmath::Vector3::new(NUM_INSTANCES_PER_ROW as f32 * 0.5, 0.0, NUM_INSTANCES_PER_ROW as f32 * 0.5);
-
-use image::GenericImageView;
+use image::{GenericImageView, DynamicImage};
 
 struct GraphicsProcessor {
     device: wgpu::Device,
@@ -130,7 +147,7 @@ struct GraphicsProcessor {
     index_buffer: wgpu::Buffer,
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
-    diffuse_bind_group: wgpu::BindGroup,
+    textures_bind_group: wgpu::BindGroup,
 }
 
 impl GraphicsProcessor {
@@ -144,26 +161,12 @@ impl GraphicsProcessor {
     
         let scale = dimensions.0 as f32 / dimensions.1 as f32;
     
-        let instances = vec![
-            Instance{
-                position: cgmath::Vector3::new(0.5, 0.0, 0.0),
-                rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(60.0)),
-                scale: cgmath::Vector3::new(scale, 1.0, 1.0)
-            },
-            Instance{
-                position: cgmath::Vector3::new(-0.5, 0.0, 0.0),
-                rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0)),
-                scale: cgmath::Vector3::new(scale,1.0, 1.0)
-            },
-        ];
-    
-    
         // Specify the required features
-        let features = Features::TEXTURE_BINDING_ARRAY;
+        let features = Features::TEXTURE_BINDING_ARRAY | Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING;
     
         // Specify the limits, including the maximum texture array layer count
         let limits = Limits {
-            max_texture_array_layers: 2, // Adjust this based on your needs
+            max_texture_array_layers: 256, // Adjust this based on your needs
             ..Default::default()
         };
 
@@ -202,19 +205,17 @@ impl GraphicsProcessor {
             }
         );
     
-    
-        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
+        
+        // create an empty instance buffer
+        let instance_data = [];
         let instance_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Instance Buffer"),
-                contents: bytemuck::cast_slice(&instance_data),
+                contents: &instance_data,
                 usage: wgpu::BufferUsages::VERTEX,
             }
         );
-    
-    
-    
-    
+
         let texture_size = wgpu::Extent3d {
             width: dimensions.0,
             height: dimensions.1,
@@ -303,7 +304,7 @@ impl GraphicsProcessor {
                 });
     
     
-        let diffuse_bind_group = device.create_bind_group(
+        let textures_bind_group = device.create_bind_group(
             &wgpu::BindGroupDescriptor {
                 layout: &texture_bind_group_layout,
                 entries: &[
@@ -365,10 +366,24 @@ impl GraphicsProcessor {
             render_pipeline: pipeline,
             vertex_buffer,
             index_buffer,
-            instances: instances,
+            instances: vec![],
             instance_buffer: instance_buffer,
-            diffuse_bind_group: diffuse_bind_group,
+            textures_bind_group,
         }
+    }
+
+    pub fn add_instances(&mut self, instance: Vec<Instance>) {
+        self.instances.extend(instance);
+        //recreate the buffer
+        self.instance_buffer = self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Instance Buffer"),
+                contents: bytemuck::cast_slice(&self.instances.iter().map(Instance::to_raw).collect::<Vec<_>>()),
+                usage: wgpu::BufferUsages::VERTEX,
+            }
+        );
+        
+
     }
 
     pub async fn run(&mut self, _path: Option<String>) {
@@ -423,7 +438,7 @@ impl GraphicsProcessor {
             });
             render_pass.set_pipeline(&self.render_pipeline);
             //add texture
-            render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
+            render_pass.set_bind_group(0, &self.textures_bind_group, &[]);
             //add vertrices
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16); 
@@ -484,9 +499,94 @@ impl GraphicsProcessor {
     }
 }
 
+struct ImageWrapper {
+    pub image: DynamicImage,
+    pub texture_id: u32,
+}
+
+struct Graphic2D {
+    x: f32,
+    y: f32,
+    rot: f32,
+    image: Rc::<ImageWrapper>,
+}
+
+impl Graphic2D{
+    fn new(x: f32, y: f32, rot: f32, image: Rc<ImageWrapper>) -> Graphic2D {
+        Graphic2D {
+            x: x,
+            y: y,
+            rot: rot,
+            image: image,
+        }
+    }
+
+    fn get_image(&self) -> Rc<ImageWrapper> {
+        self.image.clone()
+    }
+
+    fn create_instance(&self) -> Instance {
+        Instance {
+            position: cgmath::Vector3::new(self.x, self.y, 0.0),
+            rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(self.rot)),
+            scale: cgmath::Vector3::new(1.0, 1.0, 1.0),
+            texture_index: 0,
+        }
+    }
+}
+
+
+struct App {
+    pub graphics_processor: GraphicsProcessor,
+    pub images: Vec<Rc<ImageWrapper>>,
+    pub shapes: Vec<Graphic2D>,
+}
+
+impl App{
+    async fn new() -> App {
+        App {
+            graphics_processor: GraphicsProcessor::new().await,
+            images: vec![],
+            shapes: vec![],
+        }
+    }
+
+    fn load_images(&mut self, _path : String) {
+        for entry in std::fs::read_dir(_path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let image = image::open(path).unwrap();
+            let texture_id = self.images.len() as u32;
+            self.images.push(Rc::new(ImageWrapper {
+                image: image,
+                texture_id: texture_id,
+            }));
+        }
+    }
+
+    fn add_shapes(&mut self, new_shapes: Vec<Graphic2D>) {
+        let instances = new_shapes.iter().map(|shape| shape.create_instance()).collect::<Vec<_>>();
+        self.shapes.extend(new_shapes);
+        self.graphics_processor.add_instances(instances)
+    }
+
+    async fn run(&mut self, _path: Option<String>) {
+        self.graphics_processor.run(_path).await;
+    }
+
+}
+
+
+
 async fn run(_path: Option<String>) {
-    let mut state = GraphicsProcessor::new().await;
-    state.run(_path).await
+    let mut app = App::new().await;
+    app.load_images("./assets/sources/minecraft".to_string());
+
+    let shape = Graphic2D::new(0.0, 0.0, 0.0, app.images[0].clone());
+    app.add_shapes(vec![shape]);
+  
+
+    app.run(_path).await;
 }
 
 fn main() {
