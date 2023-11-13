@@ -9,8 +9,6 @@ use wgpu::{Features, Limits, BindGroup, Queue, Device, BindGroupLayout, util::De
 #[cfg(target_arch = "wasm32")]
 use wgpu_example::utils::output_image_wasm;
 
-const TEXTURE_DIMS: (usize, usize) = (512, 512);
-
 use cgmath;
 use cgmath::prelude::*;
 
@@ -47,15 +45,23 @@ struct Instance {
     rotation: cgmath::Quaternion<f32>,
     scale: cgmath::Vector3<f32>,
     texture_index: u32,
+    post_scale : cgmath::Vector3<f32>,
 }
 
 impl Instance {
     fn to_raw(&self) -> InstanceRaw {
 
         InstanceRaw {
-            model:(cgmath::Matrix4::from_translation(self.position) * cgmath::Matrix4::from(self.rotation) * cgmath::Matrix4::from_nonuniform_scale(self.scale.x, self.scale.y, self.scale.z) ).into(),
+            model:( cgmath::Matrix4::from_nonuniform_scale(self.post_scale.x, self.post_scale.y, self.post_scale.z) * cgmath::Matrix4::from_translation(self.position) * cgmath::Matrix4::from(self.rotation) * cgmath::Matrix4::from_nonuniform_scale(self.scale.x, self.scale.y, self.scale.z) ).into(),
             texture_index: self.texture_index,
         }
+    }
+
+    fn fix_scale(&mut self, canvas_dimensions: (usize, usize)) -> Self {
+        let canvas_dimensions = (canvas_dimensions.0 as f32, canvas_dimensions.1 as f32);
+        let ratio = canvas_dimensions.1 /  canvas_dimensions.0 ;
+        self.post_scale = cgmath::Vector3::new(ratio, 1.0, 1.0);
+        *self
     }
 
     fn new2d(position: cgmath::Vector2<f32>, scale: cgmath::Vector2<f32>, rot: f32, texture_index: u32) -> Instance {
@@ -64,6 +70,7 @@ impl Instance {
             rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(rot)),
             scale: cgmath::Vector3::new(scale.x, scale.y, 1.0),
             texture_index: texture_index,
+            post_scale: cgmath::Vector3::new(1.0, 1.0, 1.0),
         }
     }
 }
@@ -284,6 +291,7 @@ impl GraphicsProcessorBuilder{
             instance_buffer: instance_buffer,
             textures_bind_group,
             num_of_textures: 0,
+            canvas_dimensions: (dimensions.0 as usize, dimensions.1 as usize),
         }
     }
 
@@ -421,6 +429,7 @@ struct GraphicsProcessor {
     instance_buffer: wgpu::Buffer,
     textures_bind_group: wgpu::BindGroup,
     num_of_textures: u32,
+    canvas_dimensions: (usize, usize),
 }
 
 impl GraphicsProcessor {
@@ -438,19 +447,19 @@ impl GraphicsProcessor {
 
     }
 
-    pub async fn run(&mut self, _path: Option<String>) {
-    
+    pub async fn run(&mut self, _path: Option<String>, canvas_dimensions: (usize, usize)) {
+
         //-----------------------------------------------
     
         // This will later store the raw pixel value data locally. We'll create it now as
         // a convenient size reference.
-        let mut texture_data = Vec::<u8>::with_capacity(TEXTURE_DIMS.0 * TEXTURE_DIMS.1 * 4);
+        let mut texture_data = Vec::<u8>::with_capacity(canvas_dimensions.0 * canvas_dimensions.1 * 4);
 
         let render_target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {
-                width: TEXTURE_DIMS.0 as u32,
-                height: TEXTURE_DIMS.1 as u32,
+                width: canvas_dimensions.0 as u32,
+                height: canvas_dimensions.1 as u32,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -514,13 +523,13 @@ impl GraphicsProcessor {
                     offset: 0,
                     // This needs to be a multiple of 256. Normally we would need to pad
                     // it but we here know it will work out anyways.
-                    bytes_per_row: Some((TEXTURE_DIMS.0 * 4) as u32),
-                    rows_per_image: Some(TEXTURE_DIMS.1 as u32),
+                    bytes_per_row: Some((canvas_dimensions.0 * 4) as u32),
+                    rows_per_image: Some(canvas_dimensions.1 as u32),
                 },
             },
             wgpu::Extent3d {
-                width: TEXTURE_DIMS.0 as u32,
-                height: TEXTURE_DIMS.1 as u32,
+                width: canvas_dimensions.0 as u32,
+                height: canvas_dimensions.1 as u32,
                 depth_or_array_layers: 1,
             },
         );
@@ -544,9 +553,9 @@ impl GraphicsProcessor {
         output_staging_buffer.unmap();
     
         #[cfg(not(target_arch = "wasm32"))]
-        output_image_native(texture_data.to_vec(), TEXTURE_DIMS, _path.unwrap());
+        output_image_native(texture_data.to_vec(), canvas_dimensions, _path.unwrap());
         #[cfg(target_arch = "wasm32")]
-        output_image_wasm(texture_data.to_vec(), TEXTURE_DIMS);
+        output_image_wasm(texture_data.to_vec(), canvas_dimensions);
         log::info!("Done.");
     }
 }
@@ -556,20 +565,23 @@ struct ImageWrapper {
     pub texture_id: u32,
 }
 
+
 struct Graphic2D {
     x: f32,
     y: f32,
+    scale: f32,
     rot: f32,
     image: Rc::<ImageWrapper>,
 }
 
 impl Graphic2D{
-    fn new(x: f32, y: f32, rot: f32, image: Rc<ImageWrapper>) -> Graphic2D {
+    fn new(x: f32, y: f32, rot: f32, image: Rc<ImageWrapper>, scale : f32) -> Graphic2D {
         Graphic2D {
             x: x,
             y: y,
             rot: rot,
             image: image,
+            scale: scale,
         }
     }
 
@@ -578,11 +590,17 @@ impl Graphic2D{
     }
 
     fn create_instance(&self) -> Instance {
+        let height = self.image.image.height();
+        let width = self.image.image.width();
+
+        let ratio = width as f32 / height as f32;
+
         Instance {
             position: cgmath::Vector3::new(self.x, self.y, 0.0),
             rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(self.rot)),
-            scale: cgmath::Vector3::new(1.0, 1.0, 1.0),
-            texture_index: 0,
+            scale: cgmath::Vector3::new(ratio*self.scale, self.scale, 1.0),
+            texture_index: self.image.texture_id,
+            post_scale: cgmath::Vector3::new(1.0, 1.0, 1.0),
         }
     }
 }
@@ -591,11 +609,17 @@ impl Graphic2D{
 struct App {
     pub graphics_processor: GraphicsProcessor,
     pub images: Vec<Rc<ImageWrapper>>,
+    pub target_image: Graphic2D,
     pub shapes: Vec<Graphic2D>,
 }
 
 impl App{
-    fn load_images(_path : String) -> Vec<Rc<ImageWrapper>> {
+    fn get_canvas_dimensions(&self) ->(usize, usize) {
+        let canvas_dimensions = self.target_image.image.image.dimensions();
+        (canvas_dimensions.0 as usize, canvas_dimensions.1 as usize)
+    }
+
+    fn load_images(_path : String, upto : u32) -> Vec<Rc<ImageWrapper>> {
         let mut images = vec![];
         
         for (texture_id, entry) in std::fs::read_dir(_path).unwrap().enumerate() {
@@ -604,7 +628,7 @@ impl App{
             let image = image::open(path).unwrap();
             images.push(Rc::new(ImageWrapper {
                 image: image,
-                texture_id: texture_id as u32,
+                texture_id: texture_id as u32 + upto,
             }));
         }
 
@@ -612,37 +636,55 @@ impl App{
     }
 
     fn add_shapes(&mut self, new_shapes: Vec<Graphic2D>) {
-        let instances = new_shapes.iter().map(|shape| shape.create_instance()).collect::<Vec<_>>();
         self.shapes.extend(new_shapes);
+    }
+
+    fn set_instances(&mut self) {
+        let mut instances = vec![];
+        // add background image
+        instances.push(self.target_image.create_instance().fix_scale(self.get_canvas_dimensions()));
+        //add shapess
+        instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
         self.graphics_processor.add_instances(instances)
     }
 
     async fn run(&mut self, _path: Option<String>) {
-        self.graphics_processor.run(_path).await;
+        self.set_instances();
+        self.graphics_processor.run(_path, self.get_canvas_dimensions()).await;
     }
 
 }
-
-
 
 async fn run(_path: Option<String>) {
 
     let mut graphicsProcessorBuilder = GraphicsProcessorBuilder::new();
 
-    let images = App::load_images("./assets/sources/minecraft".to_string());
 
-    let image_textures = images.iter().map(|image| image.image.clone()).collect::<Vec<_>>();
+    let target_image_image = Rc::new(ImageWrapper {
+        image: image::open("./assets/targets/grapes.jpg").unwrap(),
+        texture_id: 0,
+    });
+
+    let target_image = Graphic2D::new(0.0, 0.0, 0.0, target_image_image.clone(), 2.0);
+
+    let mut images = vec![];
+    images.push(target_image_image.clone());
+
+    images.append(&mut App::load_images("./assets/sources/minecraft".to_string(), 1));
+
+    let mut image_textures = images.iter().map(|image| image.image.clone()).collect::<Vec<_>>();
 
     graphicsProcessorBuilder.set_images(image_textures);
 
     let mut app = App {
         graphics_processor: graphicsProcessorBuilder.build().await,
-        images: images,
+        images,
+        target_image: target_image,
         shapes: vec![],
     };
 
-    let shape1 = Graphic2D::new(0.0, 0.0, 0.0, app.images[0].clone());
-    let shape2 = Graphic2D::new(0.5, 0.0, 20.0, app.images[1].clone());
+    let shape1 = Graphic2D::new(0.0, 0.0, 0.0, app.images[1].clone(), 1.0);
+    let shape2 = Graphic2D::new(0.5, 0.0, 90.0, app.images[2].clone(), 1.0);
     app.add_shapes(vec![shape1, shape2]);
   
 
