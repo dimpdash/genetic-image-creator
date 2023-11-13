@@ -140,11 +140,21 @@ const INDICES: &[u16] = &[
 use image::{GenericImageView, DynamicImage};
 
 struct GraphicsProcessorBuilder {
-    images: Vec<DynamicImage>,
+    images: Option<Vec<DynamicImage>>,
 
 }
 
 impl GraphicsProcessorBuilder{
+    pub fn new() -> GraphicsProcessorBuilder {
+        GraphicsProcessorBuilder {
+            images: None,
+        }
+    }
+
+    fn set_images(&mut self, images: Vec<DynamicImage>) {
+        self.images = Some(images);
+    }
+
     pub async fn build(&self) -> GraphicsProcessor {
         let diffuse_bytes = include_bytes!("../assets/targets/grapes.jpg");
         let diffuse_image = image::load_from_memory(diffuse_bytes).unwrap();
@@ -161,6 +171,7 @@ impl GraphicsProcessorBuilder{
         // Specify the limits, including the maximum texture array layer count
         let limits = Limits {
             max_texture_array_layers: 256, // Adjust this based on your needs
+            max_sampled_textures_per_shader_stage: 256,
             ..Default::default()
         };
 
@@ -239,7 +250,21 @@ impl GraphicsProcessorBuilder{
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: "fs_main",
-                targets: &[Some(wgpu::TextureFormat::Rgba8UnormSrgb.into())],
+                targets: &[
+                    Some(wgpu::ColorTargetState{
+                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        
+                        blend: Some(wgpu::BlendState{
+                            color: wgpu::BlendComponent{
+                                src_factor: wgpu::BlendFactor::SrcAlpha,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,},
+                            alpha: wgpu::BlendComponent::OVER
+                        }),
+        
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })
+                ],
             }),
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
@@ -266,7 +291,7 @@ impl GraphicsProcessorBuilder{
         let mut texture_views = vec![];
 
 
-        for image in self.images.iter() {
+        for image in self.images.as_ref().unwrap().iter() {
 
             let image_rgba = image.to_rgba8();
             let dimensions = image.dimensions();
@@ -570,30 +595,20 @@ struct App {
 }
 
 impl App{
-    async fn new() -> App {
-        let image = image::open("./assets/targets/grapes.jpg").unwrap();
-        let GraphicsProcessorBuilder = GraphicsProcessorBuilder {
-            images: vec![image],
-        };
-
-        App {
-            graphics_processor: GraphicsProcessorBuilder.build().await,
-            images: vec![],
-            shapes: vec![],
-        }
-    }
-
-    fn load_images(&mut self, _path : String) {
-        for entry in std::fs::read_dir(_path).unwrap() {
+    fn load_images(_path : String) -> Vec<Rc<ImageWrapper>> {
+        let mut images = vec![];
+        
+        for (texture_id, entry) in std::fs::read_dir(_path).unwrap().enumerate() {
             let entry = entry.unwrap();
             let path = entry.path();
             let image = image::open(path).unwrap();
-            let texture_id = self.images.len() as u32;
-            self.images.push(Rc::new(ImageWrapper {
+            images.push(Rc::new(ImageWrapper {
                 image: image,
-                texture_id: texture_id,
+                texture_id: texture_id as u32,
             }));
         }
+
+        images
     }
 
     fn add_shapes(&mut self, new_shapes: Vec<Graphic2D>) {
@@ -611,11 +626,24 @@ impl App{
 
 
 async fn run(_path: Option<String>) {
-    let mut app = App::new().await;
-    app.load_images("./assets/sources/minecraft".to_string());
 
-    let shape = Graphic2D::new(0.0, 0.0, 0.0, app.images[0].clone());
-    app.add_shapes(vec![shape]);
+    let mut graphicsProcessorBuilder = GraphicsProcessorBuilder::new();
+
+    let images = App::load_images("./assets/sources/minecraft".to_string());
+
+    let image_textures = images.iter().map(|image| image.image.clone()).collect::<Vec<_>>();
+
+    graphicsProcessorBuilder.set_images(image_textures);
+
+    let mut app = App {
+        graphics_processor: graphicsProcessorBuilder.build().await,
+        images: images,
+        shapes: vec![],
+    };
+
+    let shape1 = Graphic2D::new(0.0, 0.0, 0.0, app.images[0].clone());
+    let shape2 = Graphic2D::new(0.5, 0.0, 20.0, app.images[1].clone());
+    app.add_shapes(vec![shape1, shape2]);
   
 
     app.run(_path).await;
