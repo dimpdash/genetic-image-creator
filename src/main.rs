@@ -365,7 +365,7 @@ impl GraphicsProcessorBuilder{
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
@@ -684,7 +684,7 @@ async fn run(_path: Option<String>) {
     };
 
     let shape1 = Graphic2D::new(0.0, 0.0, 0.0, app.images[1].clone(), 1.0);
-    let shape2 = Graphic2D::new(0.5, 0.0, 90.0, app.images[2].clone(), 1.0);
+    let shape2 = Graphic2D::new(0.5, 0.0, 30.0, app.images[2].clone(), 1.0);
     app.add_shapes(vec![shape1, shape2]);
   
 
