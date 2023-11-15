@@ -1,10 +1,8 @@
 use std::num::NonZeroU32;
-use std::ops::Range;
 use std::rc::Rc;
 
 #[cfg(not(target_arch = "wasm32"))]
 use genetic_image_creator::wgpu_utils::output_image_native;
-use imageproc::definitions::Position;
 use wgpu::{Features, Limits, BindGroup, Queue, Device, BindGroupLayout, util::DeviceExt};
 #[cfg(target_arch = "wasm32")]
 use wgpu_example::utils::output_image_wasm;
@@ -63,19 +61,8 @@ impl Instance {
         self.post_scale = cgmath::Vector3::new(ratio, 1.0, 1.0);
         *self
     }
-
-    fn new2d(position: cgmath::Vector2<f32>, scale: cgmath::Vector2<f32>, rot: f32, texture_index: u32) -> Instance {
-        Instance {
-            position: cgmath::Vector3::new(position.x, position.y, 0.0),
-            rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(rot)),
-            scale: cgmath::Vector3::new(scale.x, scale.y, 1.0),
-            texture_index: texture_index,
-            post_scale: cgmath::Vector3::new(1.0, 1.0, 1.0),
-        }
-    }
 }
 
-// Raw so do not need to worry about the quaternion
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct InstanceRaw {
@@ -163,14 +150,8 @@ impl GraphicsProcessorBuilder{
     }
 
     pub async fn build(&self) -> GraphicsProcessor {
-        let diffuse_bytes = include_bytes!("../assets/targets/grapes.jpg");
-        let diffuse_image = image::load_from_memory(diffuse_bytes).unwrap();
-        let diffuse_rgba = diffuse_image.to_rgba8();
-        
-        let dimensions = diffuse_image.dimensions();
     
     
-        let scale = dimensions.0 as f32 / dimensions.1 as f32;
     
         // Specify the required features
         let features = Features::TEXTURE_BINDING_ARRAY | Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING;
@@ -290,8 +271,6 @@ impl GraphicsProcessorBuilder{
             instances: vec![],
             instance_buffer: instance_buffer,
             textures_bind_group,
-            num_of_textures: 0,
-            canvas_dimensions: (dimensions.0 as usize, dimensions.1 as usize),
         }
     }
 
@@ -428,8 +407,6 @@ struct GraphicsProcessor {
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
     textures_bind_group: wgpu::BindGroup,
-    num_of_textures: u32,
-    canvas_dimensions: (usize, usize),
 }
 
 impl GraphicsProcessor {
@@ -585,10 +562,6 @@ impl Graphic2D{
         }
     }
 
-    fn get_image(&self) -> Rc<ImageWrapper> {
-        self.image.clone()
-    }
-
     fn create_instance(&self) -> Instance {
         let height = self.image.image.height();
         let width = self.image.image.width();
@@ -657,7 +630,7 @@ impl App{
 
 async fn run(_path: Option<String>) {
 
-    let mut graphicsProcessorBuilder = GraphicsProcessorBuilder::new();
+    let mut graphics_processor_builder = GraphicsProcessorBuilder::new();
 
 
     let target_image_image = Rc::new(ImageWrapper {
@@ -672,12 +645,12 @@ async fn run(_path: Option<String>) {
 
     images.append(&mut App::load_images("./assets/sources/minecraft".to_string(), 1));
 
-    let mut image_textures = images.iter().map(|image| image.image.clone()).collect::<Vec<_>>();
+    let image_textures = images.iter().map(|image| image.image.clone()).collect::<Vec<_>>();
 
-    graphicsProcessorBuilder.set_images(image_textures);
+    graphics_processor_builder.set_images(image_textures);
 
     let mut app = App {
-        graphics_processor: graphicsProcessorBuilder.build().await,
+        graphics_processor: graphics_processor_builder.build().await,
         images,
         target_image: target_image,
         shapes: vec![],
