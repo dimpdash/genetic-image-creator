@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 #[cfg(not(target_arch = "wasm32"))]
 use genetic_image_creator::wgpu_utils::output_image_native;
-use wgpu::{Features, Limits, BindGroup, Queue, Device, BindGroupLayout, util::DeviceExt};
+use wgpu::{Features, Limits, BindGroup, Queue, Device, BindGroupLayout, util::DeviceExt, TextureView};
 #[cfg(target_arch = "wasm32")]
 use wgpu_example::utils::output_image_wasm;
 
@@ -209,7 +209,34 @@ impl GraphicsProcessorBuilder{
             }
         );
 
-        let (textures_bind_group, textures_bind_group_layout) = self.create_textures_bind_group(&device, &queue);
+        let (textures_bind_group, textures_bind_group_layout, texture_views) = self.create_textures_bind_group(&device, &queue);
+
+        let target_image_texture_view = texture_views.first().unwrap();
+        
+        let target_image_texture_view_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            }],
+            label: Some("texture_bind_group_layout"),
+        });
+
+        let target_image_texture_view_bind_group = device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                layout: &target_image_texture_view_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&target_image_texture_view),
+                }],
+                label: Some("target_image_texture_view_bind_group"),
+            }
+        );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
@@ -326,14 +353,18 @@ impl GraphicsProcessorBuilder{
 
         let image_compare_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&texture_bind_group_layout, &computed_texture_bind_group_layout],
+            bind_group_layouts: &[
+                &texture_bind_group_layout, // target image
+                &texture_bind_group_layout, // image from shapes
+                &computed_texture_bind_group_layout // output image
+            ],
             push_constant_ranges: &[],
         });
         let image_compare_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
             layout: Some(&image_compare_pipeline_layout),
             module: &cs_module,
-            entry_point: "constant_add",
+            entry_point: "subtract_images",
         });
 
         GraphicsProcessor {
@@ -346,11 +377,12 @@ impl GraphicsProcessorBuilder{
             instances: vec![],
             instance_buffer: instance_buffer,
             textures_bind_group,
+            target_image_texture_view_bind_group,
             computed_texture_bind_group_layout,
         }
     }
 
-    fn create_textures_bind_group(& self, device: &Device, queue: &Queue) -> (BindGroup, BindGroupLayout) {
+    fn create_textures_bind_group(& self, device: &Device, queue: &Queue) -> (BindGroup, BindGroupLayout, Vec<TextureView>) {
         let mut texture_views = vec![];
 
 
@@ -470,7 +502,7 @@ impl GraphicsProcessorBuilder{
             }
         );
 
-        (textures_bind_group, textures_bind_group_layout)
+        (textures_bind_group, textures_bind_group_layout, texture_views)
     }
 }
 
@@ -484,6 +516,7 @@ struct GraphicsProcessor {
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
     textures_bind_group: wgpu::BindGroup,
+    target_image_texture_view_bind_group: wgpu::BindGroup,
     computed_texture_bind_group_layout: BindGroupLayout,
 }
 
@@ -564,6 +597,7 @@ impl GraphicsProcessor {
             }
         );
 
+
         let storage_texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {
@@ -603,7 +637,7 @@ impl GraphicsProcessor {
                     view: &texture_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::GREEN),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -626,8 +660,9 @@ impl GraphicsProcessor {
         {
             let mut compute_pass = command_encoder.begin_compute_pass(&Default::default());
             compute_pass.set_pipeline(&self.image_compare_pipeline);
-            compute_pass.set_bind_group(0, &render_texture_bind_group, &[]);
-            compute_pass.set_bind_group(1, &computed_texture_bind_group, &[]);
+            compute_pass.set_bind_group(0, &self.target_image_texture_view_bind_group, &[]);
+            compute_pass.set_bind_group(1, &render_texture_bind_group, &[]);
+            compute_pass.set_bind_group(2, &computed_texture_bind_group, &[]);
             compute_pass.dispatch_workgroups(canvas_dimensions.0 as u32, canvas_dimensions.1 as u32, 1);
 
         }
@@ -761,7 +796,7 @@ impl App{
     fn set_instances(&mut self) {
         let mut instances = vec![];
         // add background image
-        instances.push(self.target_image.create_instance().fix_scale(self.get_canvas_dimensions()));
+        // instances.push(self.target_image.create_instance().fix_scale(self.get_canvas_dimensions()));
         //add shapess
         instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
         self.graphics_processor.add_instances(instances)
