@@ -240,7 +240,7 @@ impl GraphicsProcessorBuilder{
                 entry_point: "fs_main",
                 targets: &[
                     Some(wgpu::ColorTargetState{
-                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
         
                         blend: Some(wgpu::BlendState{
                             color: wgpu::BlendComponent{
@@ -375,7 +375,7 @@ impl GraphicsProcessorBuilder{
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     // Most images are stored using sRGB so we need to reflect that here.
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
                     // TEXTURE_BINDING tells wgpu that we want to use this texture in shaders
                     // COPY_DST means that we want to copy data to this texture
                     usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
@@ -520,9 +520,9 @@ impl GraphicsProcessor {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
+            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
         });
 
         let output_staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
