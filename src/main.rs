@@ -209,7 +209,7 @@ impl GraphicsProcessorBuilder{
             }
         );
 
-        let (textures_bind_group, texture_bind_group_layout) = self.create_textures_bind_group(&device, &queue);
+        let (textures_bind_group, textures_bind_group_layout) = self.create_textures_bind_group(&device, &queue);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
@@ -220,7 +220,7 @@ impl GraphicsProcessorBuilder{
         let render_pipeline_layout =
         device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[&texture_bind_group_layout],
+            bind_group_layouts: &[&textures_bind_group_layout],
             push_constant_ranges: &[],
         });
     
@@ -262,15 +262,91 @@ impl GraphicsProcessorBuilder{
     
         log::info!("Wgpu context set up.");
 
+
+        // ******************** setup the computation pipelines ********************
+
+        let cs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            //source: wgpu::ShaderSource::SpirV(bytes_to_u32(include_bytes!("alu.spv")).into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("compute_shader.wgsl").into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }
+            ],
+        });
+        let texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None , entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+        ]});
+
+        let computed_texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("texture_bind_group_layout"),
+        });
+
+        let image_compare_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&texture_bind_group_layout, &computed_texture_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let image_compare_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&image_compare_pipeline_layout),
+            module: &cs_module,
+            entry_point: "constant_add",
+        });
+
         GraphicsProcessor {
             device,
             queue,
             render_pipeline: pipeline,
+            image_compare_pipeline,
             vertex_buffer,
             index_buffer,
             instances: vec![],
             instance_buffer: instance_buffer,
             textures_bind_group,
+            computed_texture_bind_group_layout,
         }
     }
 
@@ -390,7 +466,7 @@ impl GraphicsProcessorBuilder{
                         resource: wgpu::BindingResource::Sampler(&diffuse_sampler),
                     }
                 ],
-                label: Some("diffuse_bind_group"),
+                label: Some("diffuse_bind_group")
             }
         );
 
@@ -402,11 +478,13 @@ struct GraphicsProcessor {
     device: wgpu::Device,
     queue: wgpu::Queue,
     render_pipeline: wgpu::RenderPipeline,
+    image_compare_pipeline: wgpu::ComputePipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
     textures_bind_group: wgpu::BindGroup,
+    computed_texture_bind_group_layout: BindGroupLayout,
 }
 
 impl GraphicsProcessor {
@@ -443,7 +521,7 @@ impl GraphicsProcessor {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
         });
 
@@ -456,6 +534,65 @@ impl GraphicsProcessor {
     
 
         let texture_view = render_target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let render_texture_bind_group_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true }
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("texture_bind_group_layout"),
+        });
+
+        let render_texture_bind_group = self.device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                layout: &render_texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&texture_view),
+                    },
+                ],
+                label: Some("render_texture_bind_group"),
+            }
+        );
+
+        let storage_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: canvas_dimensions.0 as u32,
+                height: canvas_dimensions.1 as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        let storage_texture_view = storage_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let computed_texture_bind_group = self.device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                layout: &self.computed_texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&storage_texture_view),
+                    },
+                ],
+                label: Some("computed_texture_bind_group"),
+            }
+        );
     
         let mut command_encoder =
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -486,10 +623,19 @@ impl GraphicsProcessor {
     
             render_pass.draw_indexed(0..INDICES.len() as u32, 0, 0..self.instances.len() as u32);
         }
+        {
+            let mut compute_pass = command_encoder.begin_compute_pass(&Default::default());
+            compute_pass.set_pipeline(&self.image_compare_pipeline);
+            compute_pass.set_bind_group(0, &render_texture_bind_group, &[]);
+            compute_pass.set_bind_group(1, &computed_texture_bind_group, &[]);
+            compute_pass.dispatch_workgroups(canvas_dimensions.0 as u32, canvas_dimensions.1 as u32, 1);
+
+        }
+
         // The texture now contains our rendered image
         command_encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
-                texture: &render_target,
+                texture: &storage_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,

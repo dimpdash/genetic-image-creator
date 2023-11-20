@@ -27,3 +27,8 @@ path = "cmd/main/main.rs"
 [[bin]]
 name = "main"
 path = "src/main.rs"
+
+[[bin]]
+
+name = "compute"
+path = "src/compute.rs"
