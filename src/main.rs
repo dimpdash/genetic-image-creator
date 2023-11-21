@@ -131,57 +131,22 @@ const INDICES: &[u16] = &[
     0, 1, 3, // second triangle
 ];
 
-use image::{GenericImageView, DynamicImage};
-
-struct GraphicsProcessorBuilder {
-    images: Option<Vec<DynamicImage>>,
-
+struct RenderPipeline<'a> {
+    render_pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    instances: Vec<Instance>,
+    instance_buffer: wgpu::Buffer,
+    textures_bind_group: wgpu::BindGroup,
+    render_target: wgpu::Texture,
+    images: Vec<DynamicImage>,
+    output_buffer: Option<&'a wgpu::Buffer>
 }
 
-impl GraphicsProcessorBuilder{
-    pub fn new() -> GraphicsProcessorBuilder {
-        GraphicsProcessorBuilder {
-            images: None,
-        }
-    }
-
-    fn set_images(&mut self, images: Vec<DynamicImage>) {
-        self.images = Some(images);
-    }
-
-    pub async fn build(&self) -> GraphicsProcessor {
-    
-    
-    
-        // Specify the required features
-        let features = Features::TEXTURE_BINDING_ARRAY | Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING;
-    
-        // Specify the limits, including the maximum texture array layer count
-        let limits = Limits {
-            max_texture_array_layers: 256, // Adjust this based on your needs
-            max_sampled_textures_per_shader_stage: 256,
-            ..Default::default()
-        };
-
-    
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await
-            .unwrap();
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: None,
-                    features: features,
-                    limits: limits,
-                },
-                None,
-            )
-            .await
-            .unwrap();
-        
-    
+impl<'a> RenderPipeline<'a> {
+    pub fn new(graphicsProcessor: &GraphicsProcessor, canvas_dimensions : (usize, usize), images: Vec<DynamicImage>, instances: Vec<Instance>) -> RenderPipeline {
+        let device = &graphicsProcessor.device;
+        let queue = &graphicsProcessor.queue;
         // create our image data buffer
         let vertex_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
@@ -200,49 +165,21 @@ impl GraphicsProcessorBuilder{
     
         
         // create an empty instance buffer
-        let instance_data = [];
+        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
         let instance_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Instance Buffer"),
-                contents: &instance_data,
+                contents: &bytemuck::cast_slice(&instance_data),
                 usage: wgpu::BufferUsages::VERTEX,
             }
         );
 
-        let (textures_bind_group, textures_bind_group_layout, texture_views) = self.create_textures_bind_group(&device, &queue);
-
-        let target_image_texture_view = texture_views.first().unwrap();
-        
-        let target_image_texture_view_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Texture {
-                    multisampled: false,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                },
-                count: None,
-            }],
-            label: Some("texture_bind_group_layout"),
-        });
-
-        let target_image_texture_view_bind_group = device.create_bind_group(
-            &wgpu::BindGroupDescriptor {
-                layout: &target_image_texture_view_bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&target_image_texture_view),
-                }],
-                label: Some("target_image_texture_view_bind_group"),
-            }
-        );
+        let (textures_bind_group, textures_bind_group_layout, texture_views) = RenderPipeline::create_textures_bind_group(&device, &queue, &images);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("shader.wgsl"))),
         });
-
 
         let render_pipeline_layout =
         device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -286,107 +223,44 @@ impl GraphicsProcessorBuilder{
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
         });
-    
-        log::info!("Wgpu context set up.");
 
-
-        // ******************** setup the computation pipelines ********************
-
-        let cs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let render_target = graphicsProcessor.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
-            //source: wgpu::ShaderSource::SpirV(bytes_to_u32(include_bytes!("alu.spv")).into()),
-            source: wgpu::ShaderSource::Wgsl(include_str!("compute_shader.wgsl").into()),
-        });
-
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
+            size: wgpu::Extent3d {
+                width: canvas_dimensions.0 as u32,
+                height: canvas_dimensions.1 as u32,
+                depth_or_array_layers: 1,
             },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }
-            ],
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
         });
-        let texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None , entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Texture {
-                    multisampled: false,
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                },
-                count: None,
-            },
-        ]});
-
-        let computed_texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-            ],
-            label: Some("texture_bind_group_layout"),
-        });
-
-        let image_compare_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[
-                &texture_bind_group_layout, // target image
-                &texture_bind_group_layout, // image from shapes
-                &computed_texture_bind_group_layout // output image
-            ],
-            push_constant_ranges: &[],
-        });
-        let image_compare_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: None,
-            layout: Some(&image_compare_pipeline_layout),
-            module: &cs_module,
-            entry_point: "subtract_images",
-        });
-
-        GraphicsProcessor {
-            device,
-            queue,
+ 
+        RenderPipeline {
             render_pipeline: pipeline,
-            image_compare_pipeline,
-            vertex_buffer,
-            index_buffer,
-            instances: vec![],
+            vertex_buffer: vertex_buffer,
+            index_buffer: index_buffer,
+            instances: instances,
             instance_buffer: instance_buffer,
-            textures_bind_group,
-            target_image_texture_view_bind_group,
-            computed_texture_bind_group_layout,
+            textures_bind_group: textures_bind_group,
+            render_target: render_target,
+            images: images,
+            output_buffer: None,
         }
     }
 
-    fn create_textures_bind_group(& self, device: &Device, queue: &Queue) -> (BindGroup, BindGroupLayout, Vec<TextureView>) {
+    fn set_output_buffer(&mut self, output_buffer: &'a wgpu::Buffer) {
+        self.output_buffer = Some(output_buffer);
+    }
+
+    fn create_textures_bind_group(device: &Device, queue: &Queue, images: &Vec<DynamicImage>) -> (BindGroup, BindGroupLayout, Vec<TextureView>) {
         let mut texture_views = vec![];
 
 
-        for image in self.images.as_ref().unwrap().iter() {
+        for image in images.iter() {
 
             let image_rgba = image.to_rgba8();
             let dimensions = image.dimensions();
@@ -504,137 +378,16 @@ impl GraphicsProcessorBuilder{
 
         (textures_bind_group, textures_bind_group_layout, texture_views)
     }
-}
-
-struct GraphicsProcessor {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    render_pipeline: wgpu::RenderPipeline,
-    image_compare_pipeline: wgpu::ComputePipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    instances: Vec<Instance>,
-    instance_buffer: wgpu::Buffer,
-    textures_bind_group: wgpu::BindGroup,
-    target_image_texture_view_bind_group: wgpu::BindGroup,
-    computed_texture_bind_group_layout: BindGroupLayout,
-}
-
-impl GraphicsProcessor {
-    pub fn add_instances(&mut self, instance: Vec<Instance>) {
-        self.instances.extend(instance);
-        //recreate the buffer
-        self.instance_buffer = self.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Instance Buffer"),
-                contents: bytemuck::cast_slice(&self.instances.iter().map(Instance::to_raw).collect::<Vec<_>>()),
-                usage: wgpu::BufferUsages::VERTEX,
-            }
-        );
-        
-
-    }
-
-    pub async fn run(&mut self, _path: Option<String>, canvas_dimensions: (usize, usize)) {
-
-        //-----------------------------------------------
-    
-        // This will later store the raw pixel value data locally. We'll create it now as
-        // a convenient size reference.
-        let mut texture_data = Vec::<u8>::with_capacity(canvas_dimensions.0 * canvas_dimensions.1 * 4);
-
-        let render_target = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size: wgpu::Extent3d {
-                width: canvas_dimensions.0 as u32,
-                height: canvas_dimensions.1 as u32,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
-        });
-
-        let output_staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: texture_data.capacity() as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-    
-
-        let texture_view = render_target.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let render_texture_bind_group_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true }
-                    },
-                    count: None,
-                },
-            ],
-            label: Some("texture_bind_group_layout"),
-        });
-
-        let render_texture_bind_group = self.device.create_bind_group(
-            &wgpu::BindGroupDescriptor {
-                layout: &render_texture_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&texture_view),
-                    },
-                ],
-                label: Some("render_texture_bind_group"),
-            }
-        );
 
 
-        let storage_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size: wgpu::Extent3d {
-                width: canvas_dimensions.0 as u32,
-                height: canvas_dimensions.1 as u32,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+    pub fn add_to_encoder(&self, command_encoder: &mut wgpu::CommandEncoder) {
+        let render_texture_view = self.render_target.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let storage_texture_view = storage_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let computed_texture_bind_group = self.device.create_bind_group(
-            &wgpu::BindGroupDescriptor {
-                layout: &self.computed_texture_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&storage_texture_view),
-                    },
-                ],
-                label: Some("computed_texture_bind_group"),
-            }
-        );
-    
-        let mut command_encoder =
-            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &texture_view,
+                    view: &render_texture_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -654,68 +407,102 @@ impl GraphicsProcessor {
             // set the instances
             render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-    
+
             render_pass.draw_indexed(0..INDICES.len() as u32, 0, 0..self.instances.len() as u32);
         }
-        {
-            let mut compute_pass = command_encoder.begin_compute_pass(&Default::default());
-            compute_pass.set_pipeline(&self.image_compare_pipeline);
-            compute_pass.set_bind_group(0, &self.target_image_texture_view_bind_group, &[]);
-            compute_pass.set_bind_group(1, &render_texture_bind_group, &[]);
-            compute_pass.set_bind_group(2, &computed_texture_bind_group, &[]);
-            compute_pass.dispatch_workgroups(canvas_dimensions.0 as u32, canvas_dimensions.1 as u32, 1);
 
-        }
-
-        // The texture now contains our rendered image
-        command_encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
-                texture: &storage_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::ImageCopyBuffer {
-                buffer: &output_staging_buffer,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0,
-                    // This needs to be a multiple of 256. Normally we would need to pad
-                    // it but we here know it will work out anyways.
-                    bytes_per_row: Some((canvas_dimensions.0 * 4) as u32),
-                    rows_per_image: Some(canvas_dimensions.1 as u32),
+        if let Some(output_buffer) = self.output_buffer {
+            command_encoder.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture {
+                    texture: &self.render_target,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
                 },
-            },
-            wgpu::Extent3d {
-                width: canvas_dimensions.0 as u32,
-                height: canvas_dimensions.1 as u32,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.queue.submit(Some(command_encoder.finish()));
-        log::info!("Commands submitted.");
-    
-        //-----------------------------------------------
-    
-        // Time to get our image.
-        let buffer_slice = output_staging_buffer.slice(..);
-        let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |r| sender.send(r).unwrap());
-        self.device.poll(wgpu::Maintain::Wait);
-        receiver.receive().await.unwrap().unwrap();
-        log::info!("Output buffer mapped.");
-        {
-            let view = buffer_slice.get_mapped_range();
-            texture_data.extend_from_slice(&view[..]);
+                wgpu::ImageCopyBuffer {
+                    buffer: output_buffer,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4 * self.render_target.width()),
+                        rows_per_image: Some(self.render_target.height()),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: self.render_target.width(),
+                    height: self.render_target.height(),
+                    depth_or_array_layers: 1,
+                },
+            );
         }
-        log::info!("Image data copied to local.");
-        output_staging_buffer.unmap();
-    
-        #[cfg(not(target_arch = "wasm32"))]
-        output_image_native(texture_data.to_vec(), canvas_dimensions, _path.unwrap());
-        #[cfg(target_arch = "wasm32")]
-        output_image_wasm(texture_data.to_vec(), canvas_dimensions);
-        log::info!("Done.");
     }
+
+}
+
+use image::{GenericImageView, DynamicImage};
+
+struct GraphicsProcessorBuilder {
+    images: Option<Vec<DynamicImage>>,
+
+}
+
+impl GraphicsProcessorBuilder{
+    pub fn new() -> GraphicsProcessorBuilder {
+        GraphicsProcessorBuilder {
+            images: None,
+        }
+    }
+
+    fn set_images(&mut self, images: Vec<DynamicImage>) {
+        self.images = Some(images);
+    }
+
+    pub async fn build(&self) -> GraphicsProcessor {
+    
+    
+    
+        // Specify the required features
+        let features = Features::TEXTURE_BINDING_ARRAY | Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING;
+    
+        // Specify the limits, including the maximum texture array layer count
+        let limits = Limits {
+            max_texture_array_layers: 256, // Adjust this based on your needs
+            max_sampled_textures_per_shader_stage: 256,
+            ..Default::default()
+        };
+
+    
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .unwrap();
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: None,
+                    features: features,
+                    limits: limits,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        log::info!("Wgpu context set up.");
+
+        GraphicsProcessor {
+            device,
+            queue,
+        }
+    }
+}
+
+struct GraphicsProcessor {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+
+impl GraphicsProcessor {
+
 }
 
 struct ImageWrapper {
@@ -793,18 +580,60 @@ impl App{
         self.shapes.extend(new_shapes);
     }
 
-    fn set_instances(&mut self) {
+    async fn run(&mut self, _path: Option<String>) {
+        let canvas_dimensions = self.get_canvas_dimensions();
+        let image_textures = self.images.iter().map(|image| image.image.clone()).collect::<Vec<_>>();
+        let device = &self.graphics_processor.device;
+        let queue = &self.graphics_processor.queue;
+
         let mut instances = vec![];
-        // add background image
-        // instances.push(self.target_image.create_instance().fix_scale(self.get_canvas_dimensions()));
         //add shapess
         instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
-        self.graphics_processor.add_instances(instances)
-    }
 
-    async fn run(&mut self, _path: Option<String>) {
-        self.set_instances();
-        self.graphics_processor.run(_path, self.get_canvas_dimensions()).await;
+        let mut renderPipeline = RenderPipeline::new(&self.graphics_processor, self.get_canvas_dimensions(), image_textures, instances);
+    
+        let output_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (4 * canvas_dimensions.0 * canvas_dimensions.1) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        renderPipeline.set_output_buffer(&output_staging_buffer);
+
+        let mut command_encoder =
+            self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            renderPipeline.add_to_encoder(&mut command_encoder);
+        }
+
+
+        
+        queue.submit(Some(command_encoder.finish()));
+        log::info!("Commands submitted.");
+    
+        //-----------------------------------------------
+        let mut texture_data = Vec::<u8>::with_capacity(canvas_dimensions.0 * canvas_dimensions.1 * 4);
+
+        // Time to get our image.
+        let buffer_slice = output_staging_buffer.slice(..);
+        let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |r| sender.send(r).unwrap());
+        device.poll(wgpu::Maintain::Wait);
+        receiver.receive().await.unwrap().unwrap();
+        log::info!("Output buffer mapped.");
+        {
+            let view = buffer_slice.get_mapped_range();
+            texture_data.extend_from_slice(&view[..]);
+        }
+        log::info!("Image data copied to local.");
+        output_staging_buffer.unmap();
+    
+        #[cfg(not(target_arch = "wasm32"))]
+        output_image_native(texture_data.to_vec(), canvas_dimensions, _path.unwrap());
+        #[cfg(target_arch = "wasm32")]
+        output_image_wasm(texture_data.to_vec(), canvas_dimensions);
+        log::info!("Done.");
     }
 
 }
