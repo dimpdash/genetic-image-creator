@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 #[cfg(not(target_arch = "wasm32"))]
 use genetic_image_creator::wgpu_utils::output_image_native;
+use rand::Rng;
 use wgpu::{Features, Limits, BindGroup, Queue, Device, BindGroupLayout, util::DeviceExt, TextureView};
 #[cfg(target_arch = "wasm32")]
 use wgpu_example::utils::output_image_wasm;
@@ -801,7 +802,7 @@ struct ImageWrapper {
     pub texture_id: u32,
 }
 
-
+#[derive(Clone)]
 struct Graphic2D {
     x: f32,
     y: f32,
@@ -821,6 +822,35 @@ impl Graphic2D{
         }
     }
 
+    pub fn get_image(&self) -> Rc::<ImageWrapper> {
+        self.image.clone()
+    } 
+
+    pub fn mutate(&mut self, largest_scale: f32, smallest_scale: f32, target_image_width: u32, target_image_height: u32) {
+        // mutate parameters a little bit
+        let mut rng = rand::thread_rng();
+        //allow changing of position by half the images size
+        self.x += rng.gen_range(-0.1..0.1);
+        self.y += rng.gen_range(-0.1..0.1);
+        // clamp if out out bounds
+        self.x = self.x.clamp(0.0, target_image_width as f32);
+        self.y = self.y.clamp(0.0, target_image_height as f32);
+
+
+        //pick new random rotation
+        self.rot = rng.gen_range(0.0..360.0);
+
+        //pick new random scale
+        self.scale *= rng.gen_range(-0.1..0.1);
+        // clamp scale if it is too small or too big
+        self.scale = self.scale.clamp(smallest_scale, largest_scale);
+
+    }
+
+    fn get_width(&self) -> u32 {
+        (self.image.image.width() as f32 * self.scale) as u32
+    }
+
     fn create_instance(&self) -> Instance {
         let height = self.image.image.height();
         let width = self.image.image.width();
@@ -837,12 +867,117 @@ impl Graphic2D{
     }
 }
 
+struct Shaper {
+    pub source_images: Vec<Rc<ImageWrapper>>,
+
+    largest_scale: f32,
+    smallest_scale: f32,
+
+    target_image_width: u32,
+    target_image_height: u32,
+}
+
+impl Shaper {
+    fn get_random_shape(&self) -> Graphic2D {
+        let mut rng = rand::thread_rng();
+        
+        // get random image from source images
+        let random_image_index = rng.gen_range(0..self.source_images.len());
+        let random_image = self.source_images[random_image_index].clone();
+
+        let scale = rng.gen_range(self.smallest_scale..self.largest_scale);
+
+        //get random x and y within the bounds of the target
+        let x = rng.gen_range(0.0..1.0);
+        let y = rng.gen_range(0.0..1.0);
+
+        //get random rotation
+        let rot = rng.gen_range(0.0..360.0);
+
+        Graphic2D::new(x, y, rot, random_image, scale)
+    }
+
+    fn mutate_shape(&self, shape: &Graphic2D) -> Graphic2D {
+        let mut new_shape = shape.clone();
+        new_shape.mutate(self.largest_scale, self.smallest_scale, self.target_image_width, self.target_image_height);
+        new_shape
+    }
+
+
+}
+
+struct EvolutionEnvironment {
+    unranked_shapes: Vec<Graphic2D>,
+    ranked_shapes: Vec<(f32, Graphic2D)>,
+    shape_pool_size: usize,
+    shaper: Shaper,
+    duplication_factor: u32,
+    
+}
+
+impl EvolutionEnvironment {
+    pub fn new(shape_pool_size: usize, shaper: Shaper, duplication_factor: u32) -> EvolutionEnvironment {
+
+        EvolutionEnvironment {
+            unranked_shapes: vec![],
+            ranked_shapes: vec![],
+            shape_pool_size: shape_pool_size,
+            shaper,
+            duplication_factor: duplication_factor,
+
+        }
+    }
+
+    pub fn setup_pool(&mut self) {
+        //randomly generate shapes
+        self.unranked_shapes = (0..self.shape_pool_size).map(|_| {
+            let shape = self.shaper.get_random_shape();
+            (shape)
+        }).collect::<Vec<_>>();
+    }
+
+    pub fn get_unranked_shapes(&self) -> &Vec<Graphic2D> {
+        &self.unranked_shapes
+    }
+
+    pub fn rank_shapes(&mut self, scores: &Vec<f32>) {
+        //check lengths match
+        assert_eq!(scores.len(), self.unranked_shapes.len());
+
+        //zip scores and shapes together
+        let mut ranked_shapes = scores.iter().zip(self.unranked_shapes.iter())
+            .map(|(score, shape)| (*score, shape.clone()));
+
+        //add to ranked shapes
+        self.ranked_shapes.extend(&mut ranked_shapes);
+    }
+
+    pub fn cull_bad_shapes(&mut self) {
+        //sort shapes based on highest score
+        self.ranked_shapes.sort_by(|a, b| b.0.total_cmp(&a.0));
+        // keep only the best shapes
+        let num_of_shapes_to_keep = self.shape_pool_size / self.duplication_factor as usize;
+        self.ranked_shapes.truncate(num_of_shapes_to_keep);
+    }
+
+    pub fn mutate_shapes_into_unranked_pool(&mut self) {
+        for (_, shape) in self.ranked_shapes.iter() {
+            for _ in 0..self.duplication_factor {
+                let new_shape = self.shaper.mutate_shape(shape);
+                self.unranked_shapes.push(new_shape);
+            }
+        }
+    }
+
+
+}
 
 struct App {
     pub graphics_processor: GraphicsProcessor,
     pub images: Vec<Rc<ImageWrapper>>,
     pub target_image: Graphic2D,
     pub shapes: Vec<Graphic2D>,
+    pub evolution_environment: EvolutionEnvironment,
 }
 
 impl App{
@@ -939,9 +1074,8 @@ impl App{
         let device = &self.graphics_processor.device;
         let queue = &self.graphics_processor.queue;
 
-        let shape1 = Graphic2D::new(-0.5, -0.5, 10.0, self.images[3].clone(), 1.0);
-        let shape2 = Graphic2D::new(0.5, 0.4, -30.0, self.images[4].clone(), 1.0);
-        let next_shapes = vec![shape1, shape2];
+        self.evolution_environment.setup_pool();
+        let next_shapes = self.evolution_environment.get_unranked_shapes();
 
         let mut output_staging_buffers = next_shapes.iter().map(|_| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -1059,11 +1193,22 @@ async fn run(_path: Option<String>) {
 
     graphics_processor_builder.set_images(image_textures);
 
+    let shaper = Shaper {
+        source_images: images.clone(),
+        largest_scale: 1.3,
+        smallest_scale: 0.1,
+        target_image_width: target_image.image.image.width(),
+        target_image_height: target_image.image.image.height(),
+    };
+
+    let evolution_environment = EvolutionEnvironment::new(4, shaper, 2);
+
     let mut app = App {
         graphics_processor: graphics_processor_builder.build().await,
         images,
         target_image: target_image,
         shapes: vec![],
+        evolution_environment
     };
 
     let shape1 = Graphic2D::new(0.0, 0.0, 0.0, app.images[1].clone(), 1.0);
