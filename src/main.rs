@@ -950,6 +950,9 @@ impl EvolutionEnvironment {
 
         //add to ranked shapes
         self.ranked_shapes.extend(&mut ranked_shapes);
+
+        //remove from unranked shapes
+        self.unranked_shapes.clear();
     }
 
     pub fn cull_bad_shapes(&mut self) {
@@ -978,6 +981,7 @@ struct App {
     pub target_image: Graphic2D,
     pub shapes: Vec<Graphic2D>,
     pub evolution_environment: EvolutionEnvironment,
+    pub rounds: u32,
 }
 
 impl App{
@@ -1069,12 +1073,22 @@ impl App{
     }
 
     async fn run(&mut self, _path: Option<String>) {
+        self.evolution_environment.setup_pool();
+
+        for round in 0..self.rounds {
+            println!("Round: {}", round);
+            let scores = self.run_round(_path.clone()).await;
+            self.evolution_environment.rank_shapes(&scores);
+            self.evolution_environment.cull_bad_shapes();
+            self.evolution_environment.mutate_shapes_into_unranked_pool();
+        }
+    }
+
+    async fn run_round(&mut self, _path: Option<String>) -> Vec<f32> {
         let canvas_dimensions = self.get_canvas_dimensions();
         let image_textures = self.images.iter().map(|image| image.image.clone()).collect::<Vec<_>>();
         let device = &self.graphics_processor.device;
         let queue = &self.graphics_processor.queue;
-
-        self.evolution_environment.setup_pool();
         let next_shapes = self.evolution_environment.get_unranked_shapes();
 
         let mut output_staging_buffers = next_shapes.iter().map(|_| {
@@ -1093,8 +1107,8 @@ impl App{
                 mapped_at_creation: false,
             })}).collect::<Vec<_>>();
 
-        let command_buffers = izip!(next_shapes.iter(), output_staging_buffers.iter_mut(), output_sum_buffers.iter_mut())
-            .map(|(new_shape, output_staging_buffer, output_sum_buffer)| {
+        let command_buffers = izip!(next_shapes.iter(), output_sum_buffers.iter(), output_staging_buffers.iter())
+            .map(|(new_shape, output_sum_buffer, output_staging_buffer)| {
                 let mut instances = vec![];
                 //add shapess
                 instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
@@ -1103,7 +1117,7 @@ impl App{
 
                 let mut renderPipeline = RenderPipeline::new(&self.graphics_processor, self.get_canvas_dimensions(), &image_textures, instances);
                 //Uncomment to get the render target
-                // renderPipeline.set_output_buffer(&output_staging_buffer);
+                renderPipeline.set_output_buffer(&output_staging_buffer);
 
                 let mut command_encoder =
                     self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -1118,7 +1132,7 @@ impl App{
 
                 let subtractPipeline = TextureSubtractPipeline::new(&self.graphics_processor, &target_image, rendered_image);
                 subtractPipeline.add_to_encoder(&mut command_encoder);
-                subtractPipeline.copy_output_to_buffer(&mut command_encoder, output_staging_buffer);
+                // subtractPipeline.copy_output_to_buffer(&mut command_encoder, output_staging_buffer);
                 let output_texture = subtractPipeline.output_texture;
 
                 let sumPipeline = SumTexturePipeline::new(&self.graphics_processor, &output_texture);
@@ -1130,12 +1144,14 @@ impl App{
 
         queue.submit(command_buffers);
 
+        let mut scores = vec![];
+
         for (i, (output_staging_buffer, output_sum_buffer)) in izip!(output_staging_buffers.iter(), output_sum_buffers.iter()).enumerate() {
 
-            //-----------------------------------------------
+        //     //-----------------------------------------------
             let mut texture_data = Vec::<u8>::with_capacity(canvas_dimensions.0 * canvas_dimensions.1 * 4);
 
-            // Time to get our image.
+        //     // Time to get our image.
             let buffer_slice = output_staging_buffer.slice(..);
             let sum_slice = output_sum_buffer.slice(..);
             let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
@@ -1154,10 +1170,10 @@ impl App{
                 let view = sum_slice.get_mapped_range();
                 let sum: &[f32] = bytemuck::cast_slice(&view);
                 log::info!("Sum: {}", sum[0]);
+                scores.push(sum[0]);
 
             }
             log::info!("Image data copied to local.");
-            output_staging_buffer.unmap();
 
             #[cfg(not(target_arch = "wasm32"))]
             let _path = _path.clone().unwrap().replace(".png", &format!("{}.png", i));
@@ -1166,6 +1182,20 @@ impl App{
             output_image_wasm(texture_data.to_vec(), canvas_dimensions);
             log::info!("Done.");
         }
+
+        for output_sum_buffer in output_sum_buffers.iter() {
+            output_sum_buffer.unmap();
+        }
+
+        for output_staging_buffer in output_staging_buffers.iter() {
+            output_staging_buffer.unmap();
+        }
+        
+        scores = next_shapes.iter().map(|shape| {
+            1.0
+        }).collect::<Vec<_>>();
+
+        return scores;
     
     
     }
@@ -1208,7 +1238,8 @@ async fn run(_path: Option<String>) {
         images,
         target_image: target_image,
         shapes: vec![],
-        evolution_environment
+        evolution_environment,
+        rounds: 10,
     };
 
     let shape1 = Graphic2D::new(0.0, 0.0, 0.0, app.images[1].clone(), 1.0);
