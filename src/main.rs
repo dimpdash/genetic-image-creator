@@ -990,6 +990,10 @@ impl App{
         (canvas_dimensions.0 as usize, canvas_dimensions.1 as usize)
     }
 
+    fn best_shape(&self) -> Graphic2D {
+        self.evolution_environment.ranked_shapes[0].1.clone()
+    }
+
     fn load_images(_path : String, upto : u32) -> Vec<Rc<ImageWrapper>> {
         let mut images = vec![];
         
@@ -1082,6 +1086,10 @@ impl App{
             self.evolution_environment.cull_bad_shapes();
             self.evolution_environment.mutate_shapes_into_unranked_pool();
         }
+        // select best shape
+        let best_shape = self.best_shape();
+        // add best shape to shapes
+        self.shapes.push(best_shape);
     }
 
     async fn run_round(&mut self, _path: Option<String>) -> Vec<f32> {
@@ -1146,54 +1154,53 @@ impl App{
 
         let mut scores = vec![];
 
-        for (i, (output_staging_buffer, output_sum_buffer)) in izip!(output_staging_buffers.iter(), output_sum_buffers.iter()).enumerate() {
+        // for (i, output_staging_buffer) in output_staging_buffers.iter().enumerate() {
+        //     {
+        //         let mut texture_data = Vec::<u8>::with_capacity(canvas_dimensions.0 * canvas_dimensions.1 * 4);
 
-        //     //-----------------------------------------------
-            let mut texture_data = Vec::<u8>::with_capacity(canvas_dimensions.0 * canvas_dimensions.1 * 4);
+        //         // Time to get our image.
+        //         let buffer_slice = output_staging_buffer.slice(..);
+        //         let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+        //         buffer_slice.map_async(wgpu::MapMode::Read, move |r| sender.send(r).unwrap());
+                
+        //         device.poll(wgpu::Maintain::Wait);
+        //         receiver.receive().await.unwrap().unwrap();
+        //         log::info!("Output buffer mapped.");
+        //         {
+        //             let view = buffer_slice.get_mapped_range();
+        //             texture_data.extend_from_slice(&view[..]);
+        //         }
+        //         log::info!("Image data copied to local.");
+    
+        //         #[cfg(not(target_arch = "wasm32"))]
+        //         let _path = _path.clone().unwrap().replace(".png", &format!("{}.png", i));
+        //         output_image_native(texture_data.to_vec(), canvas_dimensions, _path);
+        //         #[cfg(target_arch = "wasm32")]
+        //         output_image_wasm(texture_data.to_vec(), canvas_dimensions);
+        //         log::info!("Done.");
+        //     }
+        //     output_staging_buffer.unmap();
+        // }
 
-        //     // Time to get our image.
-            let buffer_slice = output_staging_buffer.slice(..);
-            let sum_slice = output_sum_buffer.slice(..);
-            let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
-            let (sender2, reciever2) = futures_intrusive::channel::shared::oneshot_channel();
-            buffer_slice.map_async(wgpu::MapMode::Read, move |r| sender.send(r).unwrap());
-            sum_slice.map_async(wgpu::MapMode::Read, move |r| sender2.send(r).unwrap());
-            
-            device.poll(wgpu::Maintain::Wait);
-            receiver.receive().await.unwrap().unwrap();
-            reciever2.receive().await.unwrap().unwrap();
-            log::info!("Output buffer mapped.");
+        for (output_sum_buffer) in output_sum_buffers.iter() {
             {
-                let view = buffer_slice.get_mapped_range();
-                texture_data.extend_from_slice(&view[..]);
-
-                let view = sum_slice.get_mapped_range();
-                let sum: &[f32] = bytemuck::cast_slice(&view);
-                log::info!("Sum: {}", sum[0]);
-                scores.push(sum[0]);
-
+                let sum_slice = output_sum_buffer.slice(..);
+                let (sender2, reciever2) = futures_intrusive::channel::shared::oneshot_channel();
+                sum_slice.map_async(wgpu::MapMode::Read, move |r| sender2.send(r).unwrap());
+                
+                device.poll(wgpu::Maintain::Wait);
+                reciever2.receive().await.unwrap().unwrap();
+                log::info!("Output buffer mapped.");
+                {
+                    let view = sum_slice.get_mapped_range();
+                    let sum: &[f32] = bytemuck::cast_slice(&view);
+                    log::info!("Sum: {}", sum[0]);
+                    scores.push(sum[0]);
+    
+                }
             }
-            log::info!("Image data copied to local.");
-
-            #[cfg(not(target_arch = "wasm32"))]
-            let _path = _path.clone().unwrap().replace(".png", &format!("{}.png", i));
-            output_image_native(texture_data.to_vec(), canvas_dimensions, _path);
-            #[cfg(target_arch = "wasm32")]
-            output_image_wasm(texture_data.to_vec(), canvas_dimensions);
-            log::info!("Done.");
-        }
-
-        for output_sum_buffer in output_sum_buffers.iter() {
             output_sum_buffer.unmap();
         }
-
-        for output_staging_buffer in output_staging_buffers.iter() {
-            output_staging_buffer.unmap();
-        }
-        
-        scores = next_shapes.iter().map(|shape| {
-            1.0
-        }).collect::<Vec<_>>();
 
         return scores;
     
