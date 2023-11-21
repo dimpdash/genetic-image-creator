@@ -143,7 +143,7 @@ struct RenderPipeline<'a> {
 }
 
 impl<'a> RenderPipeline<'a> {
-    pub fn new(graphicsProcessor: &GraphicsProcessor, canvas_dimensions : (usize, usize), images: Vec<DynamicImage>, instances: Vec<Instance>) -> RenderPipeline {
+    pub fn new(graphicsProcessor: &GraphicsProcessor, canvas_dimensions : (usize, usize), images: &Vec<DynamicImage>, instances: Vec<Instance>) -> RenderPipeline<'a> {
         let device = &graphicsProcessor.device;
         let queue = &graphicsProcessor.queue;
         // create our image data buffer
@@ -173,7 +173,7 @@ impl<'a> RenderPipeline<'a> {
             }
         );
 
-        let (textures_bind_group, textures_bind_group_layout, texture_views) = RenderPipeline::create_textures_bind_group(&device, &queue, &images);
+        let (textures_bind_group, textures_bind_group_layout, texture_views) = RenderPipeline::create_textures_bind_group(&device, &queue, images);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
@@ -762,98 +762,121 @@ impl App{
         let device = &self.graphics_processor.device;
         let queue = &self.graphics_processor.queue;
 
-        let mut instances = vec![];
-        //add shapess
-        instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
+        let runs = 2;
 
-        let mut renderPipeline = RenderPipeline::new(&self.graphics_processor, self.get_canvas_dimensions(), image_textures, instances);
-        // renderPipeline.set_output_buffer(&output_staging_buffer);
+        
+        let shape1 = Graphic2D::new(-0.5, -0.5, 10.0, self.images[3].clone(), 1.0);
+        let shape2 = Graphic2D::new(0.5, 0.4, -30.0, self.images[4].clone(), 1.0);
+        let next_shapes = vec![shape1, shape2];
+
+        let mut output_staging_buffers = next_shapes.iter().map(|_| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (4 * canvas_dimensions.0 * canvas_dimensions.1) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })}).collect::<Vec<_>>();
+
+        for (i, output_staging_buffer) in output_staging_buffers.iter().enumerate() {
+            let new_shape = next_shapes[i].create_instance().fix_scale(self.get_canvas_dimensions());
+
+            let mut instances = vec![];
+            //add shapess
+            instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
+            //add new shape
+            instances.push(new_shape);
+
+            let mut renderPipeline = RenderPipeline::new(&self.graphics_processor, self.get_canvas_dimensions(), &image_textures, instances);
+            //Uncomment to get the render target
+            // renderPipeline.set_output_buffer(&output_staging_buffer);
 
 
-        let mut command_encoder =
-            self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let mut command_encoder =
+                self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-        renderPipeline.add_to_encoder(&mut command_encoder);
+            renderPipeline.add_to_encoder(&mut command_encoder);
 
-        // subtract from target image
-        let rendered_image = renderPipeline.get_render_target();
-        let target_image = self.create_target_texture();
+            // subtract from target image
+            let rendered_image = renderPipeline.get_render_target();
+            let target_image = self.create_target_texture();
 
-        //create storage texture to store difference in 
-        let output_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size: wgpu::Extent3d {
-                width: canvas_dimensions.0 as u32,
-                height: canvas_dimensions.1 as u32,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
-        });
-
-        let subtractPipeline = TextureSubtractPipeline::new(&self.graphics_processor, &target_image, rendered_image, &output_texture);
-        subtractPipeline.add_to_encoder(&mut command_encoder);
-
-        //copy output texture to staging buffer
-        let output_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (4 * canvas_dimensions.0 * canvas_dimensions.1) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        command_encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
-                texture: &output_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::ImageCopyBuffer {
-                buffer: &output_staging_buffer,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * output_texture.width()),
-                    rows_per_image: Some(output_texture.height()),
+            //create storage texture to store difference in 
+            let output_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: canvas_dimensions.0 as u32,
+                    height: canvas_dimensions.1 as u32,
+                    depth_or_array_layers: 1,
                 },
-            },
-            wgpu::Extent3d {
-                width: output_texture.width(),
-                height: output_texture.height(),
-                depth_or_array_layers: 1,
-            },
-        );
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+            });
 
-            
-        queue.submit(Some(command_encoder.finish()));
-        log::info!("Commands submitted.");
-    
-        //-----------------------------------------------
-        let mut texture_data = Vec::<u8>::with_capacity(canvas_dimensions.0 * canvas_dimensions.1 * 4);
+            let subtractPipeline = TextureSubtractPipeline::new(&self.graphics_processor, &target_image, rendered_image, &output_texture);
+            subtractPipeline.add_to_encoder(&mut command_encoder);
 
-        // Time to get our image.
-        let buffer_slice = output_staging_buffer.slice(..);
-        let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |r| sender.send(r).unwrap());
-        device.poll(wgpu::Maintain::Wait);
-        receiver.receive().await.unwrap().unwrap();
-        log::info!("Output buffer mapped.");
-        {
-            let view = buffer_slice.get_mapped_range();
-            texture_data.extend_from_slice(&view[..]);
+            //copy output texture to staging buffer
+
+            command_encoder.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture {
+                    texture: &output_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyBuffer {
+                    buffer: &output_staging_buffer,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4 * output_texture.width()),
+                        rows_per_image: Some(output_texture.height()),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: output_texture.width(),
+                    height: output_texture.height(),
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            queue.submit(Some(command_encoder.finish()));
+
+
+            log::info!("Commands submitted.");
         }
-        log::info!("Image data copied to local.");
-        output_staging_buffer.unmap();
+
+        for (i, output_staging_buffer) in output_staging_buffers.iter().enumerate() {
+
+            //-----------------------------------------------
+            let mut texture_data = Vec::<u8>::with_capacity(canvas_dimensions.0 * canvas_dimensions.1 * 4);
+
+            // Time to get our image.
+            let buffer_slice = output_staging_buffer.slice(..);
+            let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+            buffer_slice.map_async(wgpu::MapMode::Read, move |r| sender.send(r).unwrap());
+            device.poll(wgpu::Maintain::Wait);
+            receiver.receive().await.unwrap().unwrap();
+            log::info!("Output buffer mapped.");
+            {
+                let view = buffer_slice.get_mapped_range();
+                texture_data.extend_from_slice(&view[..]);
+            }
+            log::info!("Image data copied to local.");
+            output_staging_buffer.unmap();
+
+            #[cfg(not(target_arch = "wasm32"))]
+            let _path = _path.clone().unwrap().replace(".png", &format!("{}.png", i));
+            output_image_native(texture_data.to_vec(), canvas_dimensions, _path);
+            #[cfg(target_arch = "wasm32")]
+            output_image_wasm(texture_data.to_vec(), canvas_dimensions);
+            log::info!("Done.");
+        }
     
-        #[cfg(not(target_arch = "wasm32"))]
-        output_image_native(texture_data.to_vec(), canvas_dimensions, _path.unwrap());
-        #[cfg(target_arch = "wasm32")]
-        output_image_wasm(texture_data.to_vec(), canvas_dimensions);
-        log::info!("Done.");
+    
     }
 
 }
