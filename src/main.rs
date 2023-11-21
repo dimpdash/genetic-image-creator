@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, future};
 use std::rc::Rc;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -11,6 +11,7 @@ use cgmath;
 use cgmath::prelude::*;
 
 use bytemuck;
+use itertools::izip;
 
 // include the repr C
 
@@ -440,20 +441,35 @@ impl<'a> RenderPipeline<'a> {
 
 }
 
+type OwnedBuf<'a> = Option<(&'a wgpu::Buffer, Option<wgpu::Buffer>)>;
+
 struct TextureSubtractPipeline<'a> {
     compute_pipeline: wgpu::ComputePipeline,
     a_texture: &'a wgpu::Texture,
     b_texture: &'a wgpu::Texture,
-    output_texture: &'a wgpu::Texture,
+    output_texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
 }
 
 impl<'a> TextureSubtractPipeline<'a> {
-    pub fn new(graphicsProcessor: &GraphicsProcessor, a_texture: &'a wgpu::Texture, b_texture: &'a wgpu::Texture, output_texture: &'a wgpu::Texture) -> TextureSubtractPipeline<'a> {
+    pub fn new(graphicsProcessor: &GraphicsProcessor, a_texture: &'a wgpu::Texture, b_texture: &'a wgpu::Texture) -> TextureSubtractPipeline<'a> {
         let device = &graphicsProcessor.device;
         let queue = &graphicsProcessor.queue;
 
-        
+        let output_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: a_texture.width(),
+                height: a_texture.height(),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+        });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
@@ -549,7 +565,168 @@ impl<'a> TextureSubtractPipeline<'a> {
         cpass.set_bind_group(0, &self.bind_group, &[]);
         cpass.dispatch_workgroups(self.a_texture.width(), self.b_texture.height(), 1);
     }
+
+    pub fn copy_output_to_buffer(&self, command_encoder: &mut wgpu::CommandEncoder, output_buffer: &wgpu::Buffer) {
+        command_encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &self.output_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: output_buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * self.output_texture.width()),
+                    rows_per_image: Some(self.output_texture.height()),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.output_texture.width(),
+                height: self.output_texture.height(),
+                depth_or_array_layers: 1,
+            },
+        );
+    }
     
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct ImageSizeContents {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ImageSizeContents {
+    // https://sotrh.github.io/learn-wgpu/beginner/tutorial4-buffer/#so-what-do-i-do-with-it
+    const ATTRIBS: [wgpu::VertexAttribute; 2] =
+    wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32];
+
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        use std::mem;
+
+        wgpu::VertexBufferLayout {
+            array_stride: mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
+struct SumTexturePipeline<'a> {
+    compute_pipeline: wgpu::ComputePipeline,
+    input_texture: &'a wgpu::Texture,
+    output_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl<'a> SumTexturePipeline<'a> {
+    pub fn new(graphicsProcessor: &GraphicsProcessor, input_texture: &'a wgpu::Texture) -> SumTexturePipeline<'a> {
+        let device = &graphicsProcessor.device;
+        let queue = &graphicsProcessor.queue;
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("add_shader.wgsl"))),
+        });
+
+            // create bind group
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { 
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                //output buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("compute_bind_group_layout"),
+        });
+
+        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: std::mem::size_of::<f32>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&input_texture.create_view(&wgpu::TextureViewDescriptor::default())),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &output_buffer,
+                            offset: 0,
+                            size: None,
+                        }),
+                    }
+                ],
+                label: Some("compute_bind_group")
+            }
+        );
+
+        let compute_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Compute Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "add",
+        });
+
+        SumTexturePipeline {
+            compute_pipeline: pipeline,
+            input_texture,
+            output_buffer,
+            bind_group,
+        }
+    }
+
+    pub fn add_to_encoder(&self, command_encoder: &mut wgpu::CommandEncoder) {
+        let mut cpass = command_encoder.begin_compute_pass(&Default::default());
+        cpass.set_pipeline(&self.compute_pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        // for now summing is done just on one thread
+        cpass.dispatch_workgroups(1, 1, 1);
+    }
+
+    pub fn copy_output_to_buffer(&self, command_encoder: &mut wgpu::CommandEncoder, output_buffer: &wgpu::Buffer) {
+        command_encoder.copy_buffer_to_buffer(
+            &self.output_buffer,
+            0,
+            output_buffer,
+            0,
+            4,
+        );
+    }
 }
 
 use image::{GenericImageView, DynamicImage};
@@ -762,108 +939,88 @@ impl App{
         let device = &self.graphics_processor.device;
         let queue = &self.graphics_processor.queue;
 
-        let runs = 2;
-
-        
         let shape1 = Graphic2D::new(-0.5, -0.5, 10.0, self.images[3].clone(), 1.0);
         let shape2 = Graphic2D::new(0.5, 0.4, -30.0, self.images[4].clone(), 1.0);
         let next_shapes = vec![shape1, shape2];
 
         let mut output_staging_buffers = next_shapes.iter().map(|_| {
             device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: (4 * canvas_dimensions.0 * canvas_dimensions.1) as u64,
+                label: (Some("Output Staging Buffer")),
+                size: (std::mem::size_of::<f32>() * canvas_dimensions.0 * canvas_dimensions.1) as u64,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             })}).collect::<Vec<_>>();
 
-        for (i, output_staging_buffer) in output_staging_buffers.iter().enumerate() {
-            let new_shape = next_shapes[i].create_instance().fix_scale(self.get_canvas_dimensions());
+        let mut output_sum_buffers = next_shapes.iter().map(|_| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Output Sum Buffer"),
+                size: std::mem::size_of::<f32>() as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })}).collect::<Vec<_>>();
 
-            let mut instances = vec![];
-            //add shapess
-            instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
-            //add new shape
-            instances.push(new_shape);
+        let command_buffers = izip!(next_shapes.iter(), output_staging_buffers.iter_mut(), output_sum_buffers.iter_mut())
+            .map(|(new_shape, output_staging_buffer, output_sum_buffer)| {
+                let mut instances = vec![];
+                //add shapess
+                instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
+                //add new shape
+                instances.push(new_shape.create_instance().fix_scale(self.get_canvas_dimensions()));
 
-            let mut renderPipeline = RenderPipeline::new(&self.graphics_processor, self.get_canvas_dimensions(), &image_textures, instances);
-            //Uncomment to get the render target
-            // renderPipeline.set_output_buffer(&output_staging_buffer);
+                let mut renderPipeline = RenderPipeline::new(&self.graphics_processor, self.get_canvas_dimensions(), &image_textures, instances);
+                //Uncomment to get the render target
+                // renderPipeline.set_output_buffer(&output_staging_buffer);
 
+                let mut command_encoder =
+                    self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-            let mut command_encoder =
-                self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                renderPipeline.add_to_encoder(&mut command_encoder);
 
-            renderPipeline.add_to_encoder(&mut command_encoder);
+                // subtract from target image
+                let rendered_image = renderPipeline.get_render_target();
+                let target_image = self.create_target_texture();
 
-            // subtract from target image
-            let rendered_image = renderPipeline.get_render_target();
-            let target_image = self.create_target_texture();
+                //create storage texture to store difference in 
 
-            //create storage texture to store difference in 
-            let output_texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d {
-                    width: canvas_dimensions.0 as u32,
-                    height: canvas_dimensions.1 as u32,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
-            });
+                let subtractPipeline = TextureSubtractPipeline::new(&self.graphics_processor, &target_image, rendered_image);
+                subtractPipeline.add_to_encoder(&mut command_encoder);
+                subtractPipeline.copy_output_to_buffer(&mut command_encoder, output_staging_buffer);
+                let output_texture = subtractPipeline.output_texture;
 
-            let subtractPipeline = TextureSubtractPipeline::new(&self.graphics_processor, &target_image, rendered_image, &output_texture);
-            subtractPipeline.add_to_encoder(&mut command_encoder);
+                let sumPipeline = SumTexturePipeline::new(&self.graphics_processor, &output_texture);
+                sumPipeline.add_to_encoder(&mut command_encoder);
+                sumPipeline.copy_output_to_buffer(&mut command_encoder, output_sum_buffer);
 
-            //copy output texture to staging buffer
+                command_encoder.finish()
+        }).collect::<Vec<_>>();
 
-            command_encoder.copy_texture_to_buffer(
-                wgpu::ImageCopyTexture {
-                    texture: &output_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::ImageCopyBuffer {
-                    buffer: &output_staging_buffer,
-                    layout: wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(4 * output_texture.width()),
-                        rows_per_image: Some(output_texture.height()),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: output_texture.width(),
-                    height: output_texture.height(),
-                    depth_or_array_layers: 1,
-                },
-            );
+        queue.submit(command_buffers);
 
-            queue.submit(Some(command_encoder.finish()));
-
-
-            log::info!("Commands submitted.");
-        }
-
-        for (i, output_staging_buffer) in output_staging_buffers.iter().enumerate() {
+        for (i, (output_staging_buffer, output_sum_buffer)) in izip!(output_staging_buffers.iter(), output_sum_buffers.iter()).enumerate() {
 
             //-----------------------------------------------
             let mut texture_data = Vec::<u8>::with_capacity(canvas_dimensions.0 * canvas_dimensions.1 * 4);
 
             // Time to get our image.
             let buffer_slice = output_staging_buffer.slice(..);
+            let sum_slice = output_sum_buffer.slice(..);
             let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+            let (sender2, reciever2) = futures_intrusive::channel::shared::oneshot_channel();
             buffer_slice.map_async(wgpu::MapMode::Read, move |r| sender.send(r).unwrap());
+            sum_slice.map_async(wgpu::MapMode::Read, move |r| sender2.send(r).unwrap());
+            
             device.poll(wgpu::Maintain::Wait);
             receiver.receive().await.unwrap().unwrap();
+            reciever2.receive().await.unwrap().unwrap();
             log::info!("Output buffer mapped.");
             {
                 let view = buffer_slice.get_mapped_range();
                 texture_data.extend_from_slice(&view[..]);
+
+                let view = sum_slice.get_mapped_range();
+                let sum: &[f32] = bytemuck::cast_slice(&view);
+                log::info!("Sum: {}", sum[0]);
+
             }
             log::info!("Image data copied to local.");
             output_staging_buffer.unmap();
