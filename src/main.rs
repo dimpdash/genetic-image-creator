@@ -139,7 +139,6 @@ struct RenderPipeline<'a> {
     instance_buffer: wgpu::Buffer,
     textures_bind_group: wgpu::BindGroup,
     render_target: wgpu::Texture,
-    images: Vec<DynamicImage>,
     output_buffer: Option<&'a wgpu::Buffer>
 }
 
@@ -247,13 +246,16 @@ impl<'a> RenderPipeline<'a> {
             instance_buffer: instance_buffer,
             textures_bind_group: textures_bind_group,
             render_target: render_target,
-            images: images,
             output_buffer: None,
         }
     }
 
     fn set_output_buffer(&mut self, output_buffer: &'a wgpu::Buffer) {
         self.output_buffer = Some(output_buffer);
+    }
+
+    fn get_render_target(&self) -> &wgpu::Texture {
+        &self.render_target
     }
 
     fn create_textures_bind_group(device: &Device, queue: &Queue, images: &Vec<DynamicImage>) -> (BindGroup, BindGroupLayout, Vec<TextureView>) {
@@ -438,6 +440,118 @@ impl<'a> RenderPipeline<'a> {
 
 }
 
+struct TextureSubtractPipeline<'a> {
+    compute_pipeline: wgpu::ComputePipeline,
+    a_texture: &'a wgpu::Texture,
+    b_texture: &'a wgpu::Texture,
+    output_texture: &'a wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
+impl<'a> TextureSubtractPipeline<'a> {
+    pub fn new(graphicsProcessor: &GraphicsProcessor, a_texture: &'a wgpu::Texture, b_texture: &'a wgpu::Texture, output_texture: &'a wgpu::Texture) -> TextureSubtractPipeline<'a> {
+        let device = &graphicsProcessor.device;
+        let queue = &graphicsProcessor.queue;
+
+        
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("compute_shader.wgsl"))),
+        });
+
+            // create bind group
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { 
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { 
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("compute_bind_group_layout"),
+        });
+
+        let bind_group = device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&a_texture.create_view(&wgpu::TextureViewDescriptor::default())),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&b_texture.create_view(&wgpu::TextureViewDescriptor::default())),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&output_texture.create_view(&wgpu::TextureViewDescriptor::default())),
+                    }
+                ],
+                label: Some("compute_bind_group")
+            }
+        );
+
+        let compute_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Compute Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "subtract_images",
+        });
+
+ 
+
+        TextureSubtractPipeline {
+            compute_pipeline: pipeline,
+            a_texture: a_texture,
+            b_texture: b_texture,
+            output_texture: output_texture,
+            bind_group,
+        }
+    }
+
+    pub fn add_to_encoder(&self, command_encoder: &mut wgpu::CommandEncoder) {
+        let mut cpass = command_encoder.begin_compute_pass(&Default::default());
+        cpass.set_pipeline(&self.compute_pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(self.a_texture.width(), self.b_texture.height(), 1);
+    }
+    
+}
+
 use image::{GenericImageView, DynamicImage};
 
 struct GraphicsProcessorBuilder {
@@ -580,6 +694,68 @@ impl App{
         self.shapes.extend(new_shapes);
     }
 
+    fn create_target_texture(&self) -> wgpu::Texture {
+        let image = &self.target_image.image.image;
+        let device = &self.graphics_processor.device;
+        let queue = &self.graphics_processor.queue;
+
+        let image_rgba = image.to_rgba8();
+        let dimensions = image.dimensions();
+
+
+        let texture_size = wgpu::Extent3d {
+            width: dimensions.0,
+            height: dimensions.1,
+            depth_or_array_layers: 1,
+        };
+
+        let texture = device.create_texture(
+            &wgpu::TextureDescriptor {
+                // All textures are stored as 3D, we represent our 2D texture
+                // by setting depth to 1.
+                size: texture_size,
+                mip_level_count: 1, // We'll talk about this a little later
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                // Most images are stored using sRGB so we need to reflect that here.
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                // TEXTURE_BINDING tells wgpu that we want to use this texture in shaders
+                // COPY_DST means that we want to copy data to this texture
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                label: Some("diffuse_texture"),
+                // This is the same as with the SurfaceConfig. It
+                // specifies what texture formats can be used to
+                // create TextureViews for this texture. The base
+                // texture format (Rgba8UnormSrgb in this case) is
+                // always supported. Note that using a different
+                // texture format is not supported on the WebGL2
+                // backend.
+                view_formats: &[],
+            }
+        );
+            
+        queue.write_texture(
+            // Tells wgpu where to copy the pixel data
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            // The actual pixel data
+            &image_rgba,
+            // The layout of the texture
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * dimensions.0),
+                rows_per_image: Some(dimensions.1),
+            },
+            texture_size,
+        );
+
+        texture
+    }
+
     async fn run(&mut self, _path: Option<String>) {
         let canvas_dimensions = self.get_canvas_dimensions();
         let image_textures = self.images.iter().map(|image| image.image.clone()).collect::<Vec<_>>();
@@ -591,7 +767,38 @@ impl App{
         instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
 
         let mut renderPipeline = RenderPipeline::new(&self.graphics_processor, self.get_canvas_dimensions(), image_textures, instances);
-    
+        // renderPipeline.set_output_buffer(&output_staging_buffer);
+
+
+        let mut command_encoder =
+            self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+        renderPipeline.add_to_encoder(&mut command_encoder);
+
+        // subtract from target image
+        let rendered_image = renderPipeline.get_render_target();
+        let target_image = self.create_target_texture();
+
+        //create storage texture to store difference in 
+        let output_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: canvas_dimensions.0 as u32,
+                height: canvas_dimensions.1 as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+        });
+
+        let subtractPipeline = TextureSubtractPipeline::new(&self.graphics_processor, &target_image, rendered_image, &output_texture);
+        subtractPipeline.add_to_encoder(&mut command_encoder);
+
+        //copy output texture to staging buffer
         let output_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: (4 * canvas_dimensions.0 * canvas_dimensions.1) as u64,
@@ -599,16 +806,29 @@ impl App{
             mapped_at_creation: false,
         });
 
-        renderPipeline.set_output_buffer(&output_staging_buffer);
+        command_encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &output_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &output_staging_buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * output_texture.width()),
+                    rows_per_image: Some(output_texture.height()),
+                },
+            },
+            wgpu::Extent3d {
+                width: output_texture.width(),
+                height: output_texture.height(),
+                depth_or_array_layers: 1,
+            },
+        );
 
-        let mut command_encoder =
-            self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        {
-            renderPipeline.add_to_encoder(&mut command_encoder);
-        }
-
-
-        
+            
         queue.submit(Some(command_encoder.finish()));
         log::info!("Commands submitted.");
     

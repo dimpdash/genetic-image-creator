@@ -73,12 +73,12 @@ fn subtractImages(target_color: vec4<f32>, shape: vec4<f32>) -> vec4<f32> {
 @binding(0)
 var target_texture_data: texture_2d<f32>;
 
-@group(1)
-@binding(0)
+@group(0)
+@binding(1)
 var shapes_texture_data: texture_2d<f32>;
 
-@group(2)
-@binding(0)
+@group(0)
+@binding(2)
 var texture_data_out: texture_storage_2d<rgba8unorm, write>;
 
 // Compute shader
