@@ -137,22 +137,19 @@ const INDICES: &[u16] = &[
     0, 1, 3, // second triangle
 ];
 
-struct RenderPipeline<'a> {
-    render_pipeline: wgpu::RenderPipeline,
+
+struct RenderPiplineFactory {
+    pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
-    instances: Vec<Instance>,
-    instance_buffer: wgpu::Buffer,
     textures_bind_group: wgpu::BindGroup,
-    render_target: wgpu::Texture,
-    output_buffer: Option<&'a wgpu::Buffer>
 }
 
-impl<'a> RenderPipeline<'a> {
-    pub fn new(graphicsProcessor: &GraphicsProcessor, canvas_dimensions : (usize, usize), images: &Vec<DynamicImage>, instances: Vec<Instance>) -> RenderPipeline<'a> {
+impl RenderPiplineFactory {
+    pub fn new(graphicsProcessor: &GraphicsProcessor, images: &Vec<DynamicImage>) -> RenderPiplineFactory {
         let device = &graphicsProcessor.device;
         let queue = &graphicsProcessor.queue;
-        // create our image data buffer
+
         let vertex_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Vertex Buffer"),
@@ -167,24 +164,13 @@ impl<'a> RenderPipeline<'a> {
                 usage: wgpu::BufferUsages::INDEX,
             }
         );
-    
-        
-        // create an empty instance buffer
-        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
-        let instance_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Instance Buffer"),
-                contents: &bytemuck::cast_slice(&instance_data),
-                usage: wgpu::BufferUsages::VERTEX,
-            }
-        );
-
-        let (textures_bind_group, textures_bind_group_layout, texture_views) = RenderPipeline::create_textures_bind_group(&device, &queue, images);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("shader.wgsl"))),
         });
+
+        let (textures_bind_group, textures_bind_group_layout, texture_views) = RenderPiplineFactory::create_textures_bind_group(&device, &queue, images);
 
         let render_pipeline_layout =
         device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -229,39 +215,13 @@ impl<'a> RenderPipeline<'a> {
             multiview: None,
         });
 
-        let render_target = graphicsProcessor.device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size: wgpu::Extent3d {
-                width: canvas_dimensions.0 as u32,
-                height: canvas_dimensions.1 as u32,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
-        });
- 
-        RenderPipeline {
-            render_pipeline: pipeline,
-            vertex_buffer: vertex_buffer,
-            index_buffer: index_buffer,
-            instances: instances,
-            instance_buffer: instance_buffer,
-            textures_bind_group: textures_bind_group,
-            render_target: render_target,
-            output_buffer: None,
+
+        RenderPiplineFactory {
+            pipeline,
+            vertex_buffer,
+            index_buffer,
+            textures_bind_group,
         }
-    }
-
-    fn set_output_buffer(&mut self, output_buffer: &'a wgpu::Buffer) {
-        self.output_buffer = Some(output_buffer);
-    }
-
-    fn get_render_target(&self) -> &wgpu::Texture {
-        &self.render_target
     }
 
     fn create_textures_bind_group(device: &Device, queue: &Queue, images: &Vec<DynamicImage>) -> (BindGroup, BindGroupLayout, Vec<TextureView>) {
@@ -386,7 +346,61 @@ impl<'a> RenderPipeline<'a> {
 
         (textures_bind_group, textures_bind_group_layout, texture_views)
     }
+}
 
+struct RenderPipelineInstance<'a> {
+    factory: &'a RenderPiplineFactory,
+    instances: Vec<Instance>,
+    instance_buffer: wgpu::Buffer,
+    render_target: wgpu::Texture,
+    output_buffer: Option<&'a wgpu::Buffer>
+}
+
+impl<'a> RenderPipelineInstance<'a> {
+
+    pub fn new(graphicsProcessor: &GraphicsProcessor, canvas_dimensions : (usize, usize), instances: Vec<Instance>, factory: &'a RenderPiplineFactory) -> RenderPipelineInstance<'a> {
+        let device = &graphicsProcessor.device;
+        // create an empty instance buffer
+        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
+        let instance_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Instance Buffer"),
+                contents: &bytemuck::cast_slice(&instance_data),
+                usage: wgpu::BufferUsages::VERTEX,
+            }
+        );
+
+        let render_target = graphicsProcessor.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: canvas_dimensions.0 as u32,
+                height: canvas_dimensions.1 as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+        });
+ 
+        RenderPipelineInstance {
+            factory: &factory,
+            instances: instances,
+            instance_buffer: instance_buffer,
+            render_target: render_target,
+            output_buffer: None,
+        }
+    }
+
+    fn set_output_buffer(&mut self, output_buffer: &'a wgpu::Buffer) {
+        self.output_buffer = Some(output_buffer);
+    }
+
+    fn get_render_target(&self) -> &wgpu::Texture {
+        &self.render_target
+    }
 
     pub fn add_to_encoder(&self, command_encoder: &mut wgpu::CommandEncoder) {
         let render_texture_view = self.render_target.create_view(&wgpu::TextureViewDescriptor::default());
@@ -406,15 +420,15 @@ impl<'a> RenderPipeline<'a> {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_pipeline(&self.factory.pipeline);
             //add texture
-            render_pass.set_bind_group(0, &self.textures_bind_group, &[]);
+            render_pass.set_bind_group(0, &self.factory.textures_bind_group, &[]);
             //add vertrices
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16); 
+            render_pass.set_vertex_buffer(0, self.factory.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(self.factory.index_buffer.slice(..), wgpu::IndexFormat::Uint16); 
             // set the instances
             render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_index_buffer(self.factory.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
 
             render_pass.draw_indexed(0..INDICES.len() as u32, 0, 0..self.instances.len() as u32);
         }
@@ -448,40 +462,21 @@ impl<'a> RenderPipeline<'a> {
 
 type OwnedBuf<'a> = Option<(&'a wgpu::Buffer, Option<wgpu::Buffer>)>;
 
-struct TextureSubtractPipeline<'a> {
+struct TextureSubtractPipelineFactory {
     compute_pipeline: wgpu::ComputePipeline,
-    a_texture: &'a wgpu::Texture,
-    b_texture: &'a wgpu::Texture,
-    output_texture: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
+    bind_group_layout: wgpu::BindGroupLayout,
 }
 
-impl<'a> TextureSubtractPipeline<'a> {
-    pub fn new(graphicsProcessor: &GraphicsProcessor, a_texture: &'a wgpu::Texture, b_texture: &'a wgpu::Texture) -> TextureSubtractPipeline<'a> {
+impl TextureSubtractPipelineFactory {
+    pub fn new(graphicsProcessor: &GraphicsProcessor) -> TextureSubtractPipelineFactory {
         let device = &graphicsProcessor.device;
-        let queue = &graphicsProcessor.queue;
-
-        let output_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size: wgpu::Extent3d {
-                width: a_texture.width(),
-                height: a_texture.height(),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
-        });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("compute_shader.wgsl"))),
         });
 
-            // create bind group
+        // create bind group
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
@@ -518,6 +513,57 @@ impl<'a> TextureSubtractPipeline<'a> {
             label: Some("compute_bind_group_layout"),
         });
 
+        let compute_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Compute Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "subtract_images",
+        });
+
+        TextureSubtractPipelineFactory {
+            compute_pipeline: pipeline,
+            bind_group_layout: bind_group_layout,
+        }
+    }
+}
+
+struct TextureSubtractPipeline<'a> {
+    compute_pipeline: &'a wgpu::ComputePipeline,
+    a_texture: &'a wgpu::Texture,
+    b_texture: &'a wgpu::Texture,
+    output_texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
+impl<'a> TextureSubtractPipeline<'a> {
+    pub fn new(graphicsProcessor: &GraphicsProcessor, a_texture: &'a wgpu::Texture, b_texture: &'a wgpu::Texture, factory: &'a TextureSubtractPipelineFactory) -> TextureSubtractPipeline<'a> {
+        let device = &graphicsProcessor.device;
+        let queue = &graphicsProcessor.queue;
+
+        let output_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: a_texture.width(),
+                height: a_texture.height(),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+        });
+
+        let bind_group_layout = &factory.bind_group_layout;
+
         let bind_group = device.create_bind_group(
             &wgpu::BindGroupDescriptor {
                 layout: &bind_group_layout,
@@ -539,24 +585,12 @@ impl<'a> TextureSubtractPipeline<'a> {
             }
         );
 
-        let compute_pipeline_layout =
-        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Compute Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
-    
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: None,
-            layout: Some(&compute_pipeline_layout),
-            module: &shader,
-            entry_point: "subtract_images",
-        });
+
 
  
 
         TextureSubtractPipeline {
-            compute_pipeline: pipeline,
+            compute_pipeline: &factory.compute_pipeline,
             a_texture: a_texture,
             b_texture: b_texture,
             output_texture: output_texture,
@@ -1239,7 +1273,7 @@ impl App{
         let queue = &self.graphics_processor.queue;
         let next_shapes = self.evolution_environment.get_unranked_shapes();
 
-        let mut output_staging_buffers = next_shapes.iter().map(|_| {
+        let output_staging_buffers = next_shapes.iter().map(|_| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: (Some("Output Staging Buffer")),
                 size: (std::mem::size_of::<f32>() * canvas_dimensions.0 * canvas_dimensions.1) as u64,
@@ -1247,12 +1281,15 @@ impl App{
                 mapped_at_creation: false,
             })}).collect::<Vec<_>>();
 
-        let mut output_sums_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        let output_sums_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Output Sum Buffer"),
                 size: (next_shapes.len() * std::mem::size_of::<f32>()) as u64,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
         });
+
+        let render_pipeline_factory = RenderPiplineFactory::new(&self.graphics_processor, &image_textures);
+        let texture_subtract_pipeline_factory = TextureSubtractPipelineFactory::new(&self.graphics_processor);
 
         println!("Creating pipelines");
         let (command_buffers, output_texture_views) = izip!(next_shapes.iter(), output_staging_buffers.iter())
@@ -1267,7 +1304,7 @@ impl App{
                 instances.push(new_shape.create_instance().fix_scale(self.get_canvas_dimensions()));
 
                 println!("Creating render pipeline");
-                let mut renderPipeline = RenderPipeline::new(&self.graphics_processor, self.get_canvas_dimensions(), &image_textures, instances);
+                let mut renderPipeline = RenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), instances, &render_pipeline_factory);
                 //Uncomment to get the render target
                 renderPipeline.set_output_buffer(&output_staging_buffer);
 
@@ -1282,7 +1319,7 @@ impl App{
 
                 //create storage texture to store difference in 
                 println!("Creating difference pipeline");
-                let subtractPipeline = TextureSubtractPipeline::new(&self.graphics_processor, &target_image, rendered_image);
+                let subtractPipeline = TextureSubtractPipeline::new(&self.graphics_processor, &target_image, rendered_image, &texture_subtract_pipeline_factory);
                 subtractPipeline.add_to_encoder(&mut command_encoder);
                 subtractPipeline.copy_output_to_buffer(&mut command_encoder, output_staging_buffer);
                 let output_texture = subtractPipeline.output_texture;
