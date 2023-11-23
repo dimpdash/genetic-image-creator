@@ -7,6 +7,7 @@ use std::sync::Arc;
 use genetic_image_creator::wgpu_utils::output_image_native;
 use rand::Rng;
 use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator, IntoParallelIterator};
+use rayon::vec;
 use wgpu::BindingResource;
 use wgpu::{Features, Limits, BindGroup, Queue, Device, BindGroupLayout, util::DeviceExt, TextureView};
 #[cfg(target_arch = "wasm32")]
@@ -75,51 +76,127 @@ struct InstanceRaw {
     model: [[f32; 4]; 4],
     texture_index: u32,
 }
+use std::mem;
 
 impl InstanceRaw {
+
+    const ATTRIBS: [wgpu::VertexAttribute; 5] = [
+        // A mat4 takes up 4 vertex slots as it is technically 4 vec4s. We need to define a slot
+        // for each vec4. We'll have to reassemble the mat4 in the shader.
+        wgpu::VertexAttribute {
+            offset: 0,
+            // While our vertex shader only uses locations 0, and 1 now, in later tutorials we'll
+            // be using 2, 3, and 4, for Vertex. We'll start at slot 5 not conflict with them later
+            shader_location: 5,
+            format: wgpu::VertexFormat::Float32x4,
+        },
+        wgpu::VertexAttribute {
+            offset: mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
+            shader_location: 6,
+            format: wgpu::VertexFormat::Float32x4,
+        },
+        wgpu::VertexAttribute {
+            offset: mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
+            shader_location: 7,
+            format: wgpu::VertexFormat::Float32x4,
+        },
+        wgpu::VertexAttribute {
+            offset: mem::size_of::<[f32; 12]>() as wgpu::BufferAddress,
+            shader_location: 8,
+            format: wgpu::VertexFormat::Float32x4,
+        },
+        // The texture index is a u32, so we need to use the Uint32 format
+        wgpu::VertexAttribute {
+            offset: mem::size_of::<[f32; 16]>() as wgpu::BufferAddress,
+            shader_location: 9,
+            format: wgpu::VertexFormat::Uint32,
+        },
+    ];
+
     fn desc() -> wgpu::VertexBufferLayout<'static> {
-        use std::mem;
         wgpu::VertexBufferLayout {
             array_stride: mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
             // We need to switch from using a step mode of Vertex to Instance
             // This means that our shaders will only change to use the next
             // instance when the shader starts processing a new instance
             step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                // A mat4 takes up 4 vertex slots as it is technically 4 vec4s. We need to define a slot
-                // for each vec4. We'll have to reassemble the mat4 in the shader.
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    // While our vertex shader only uses locations 0, and 1 now, in later tutorials we'll
-                    // be using 2, 3, and 4, for Vertex. We'll start at slot 5 not conflict with them later
-                    shader_location: 5,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
-                    shader_location: 6,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
-                    shader_location: 7,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 12]>() as wgpu::BufferAddress,
-                    shader_location: 8,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                // The texture index is a u32, so we need to use the Uint32 format
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 16]>() as wgpu::BufferAddress,
-                    shader_location: 9,
-                    format: wgpu::VertexFormat::Uint32,
-                },
-            ],
+            attributes: &InstanceRaw::ATTRIBS,
+        }
+    }
+
+
+}
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct InstanceRawMulti {
+    model: [[f32; 4]; 4],
+    texture_index: u32,
+    render_target: i32,
+}
+
+impl InstanceRawMulti {
+    const ATTRIBS: [wgpu::VertexAttribute; 6] = [
+        // A mat4 takes up 4 vertex slots as it is technically 4 vec4s. We need to define a slot
+        // for each vec4. We'll have to reassemble the mat4 in the shader.
+        wgpu::VertexAttribute {
+            offset: 0,
+            // While our vertex shader only uses locations 0, and 1 now, in later tutorials we'll
+            // be using 2, 3, and 4, for Vertex. We'll start at slot 5 not conflict with them later
+            shader_location: 5,
+            format: wgpu::VertexFormat::Float32x4,
+        },
+        wgpu::VertexAttribute {
+            offset: mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
+            shader_location: 6,
+            format: wgpu::VertexFormat::Float32x4,
+        },
+        wgpu::VertexAttribute {
+            offset: mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
+            shader_location: 7,
+            format: wgpu::VertexFormat::Float32x4,
+        },
+        wgpu::VertexAttribute {
+            offset: mem::size_of::<[f32; 12]>() as wgpu::BufferAddress,
+            shader_location: 8,
+            format: wgpu::VertexFormat::Float32x4,
+        },
+        // The texture index is a u32, so we need to use the Uint32 format
+        wgpu::VertexAttribute {
+            offset: mem::size_of::<[f32; 16]>() as wgpu::BufferAddress,
+            shader_location: 9,
+            format: wgpu::VertexFormat::Uint32,
+        },
+        // add the render target
+        wgpu::VertexAttribute {
+            offset: mem::size_of::<[f32; 16]>() as wgpu::BufferAddress + mem::size_of::<u32>() as wgpu::BufferAddress,
+            shader_location: 10,
+            format: wgpu::VertexFormat::Sint32,
+        },
+    ];
+
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        use std::mem;
+        wgpu::VertexBufferLayout {
+            array_stride: mem::size_of::<InstanceRawMulti>() as wgpu::BufferAddress,
+            // We need to switch from using a step mode of Vertex to Instance
+            // This means that our shaders will only change to use the next
+            // instance when the shader starts processing a new instance
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &InstanceRawMulti::ATTRIBS,
+        }
+    }
+
+    fn to_raw(instance: &Instance, render_target: i32) -> InstanceRawMulti {
+        let instance_raw = instance.to_raw();
+        InstanceRawMulti {
+            model: instance_raw.model,
+            texture_index: instance_raw.texture_index,
+            render_target: render_target,
         }
     }
 }
+
+
  
 
 const VERTICES: &[Vertex] = &[
@@ -136,6 +213,272 @@ const INDICES: &[u16] = &[
     0, 1, 2, // first triangle
     0, 1, 3, // second triangle
 ];
+
+struct MultiTargetRenderPiplineFactory {
+    pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    textures_bind_group: wgpu::BindGroup,
+    number_of_targets: u32,
+    number_of_targets_bind_group: wgpu::BindGroup,
+}
+
+impl MultiTargetRenderPiplineFactory {
+    pub fn new(graphicsProcessor: &GraphicsProcessor, images: &Vec<DynamicImage>, number_of_targets: u32) -> MultiTargetRenderPiplineFactory {
+        let device = &graphicsProcessor.device;
+        let queue = &graphicsProcessor.queue;
+
+        let vertex_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Vertex Buffer"),
+                contents: bytemuck::cast_slice(VERTICES),
+                usage: wgpu::BufferUsages::VERTEX,
+            }
+        );
+        let index_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Index Buffer"),
+                contents: bytemuck::cast_slice(INDICES),
+                usage: wgpu::BufferUsages::INDEX,
+            }
+        );
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("multi_shader.wgsl"))),
+        });
+
+        let (textures_bind_group, textures_bind_group_layout, texture_views) = RenderPiplineFactory::create_textures_bind_group(&device, &queue, images);
+
+        let number_of_targets_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+            label: Some("number_of_targets_bind_group_layout"),
+        });
+
+        let number_of_targets_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &number_of_targets_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("number_of_targets_buffer"),
+                        contents: bytemuck::bytes_of(&number_of_targets),
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    }),
+                    offset: 0,
+                    size: None,
+                }),
+            }],
+            label: Some("number_of_targets_bind_group"),
+        });
+
+        let render_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render Pipeline Layout"),
+            bind_group_layouts: &[
+                &textures_bind_group_layout, 
+                &number_of_targets_bind_group_layout
+            ],
+            push_constant_ranges: &[],
+        });
+
+        let targets = (0..number_of_targets).map(|_| {
+            Some(wgpu::ColorTargetState{
+                format: wgpu::TextureFormat::Rgba8Unorm,
+
+                blend: Some(wgpu::BlendState{
+                    color: wgpu::BlendComponent{
+                        src_factor: wgpu::BlendFactor::SrcAlpha,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        operation: wgpu::BlendOperation::Add,},
+                    alpha: wgpu::BlendComponent::OVER
+                }),
+
+                write_mask: wgpu::ColorWrites::ALL,
+            })}).collect::<Vec<_>>();
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline Multi Color Attachment"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[
+                    Vertex::desc(),
+                    InstanceRawMulti::desc(),
+                ],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &targets,
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
+        MultiTargetRenderPiplineFactory {
+            pipeline,
+            vertex_buffer,
+            index_buffer,
+            textures_bind_group,
+            number_of_targets,
+            number_of_targets_bind_group,
+        }
+    }
+}
+
+
+struct MultiTargetRenderPipelineInstance<'a> {
+    factory: &'a MultiTargetRenderPiplineFactory,
+    instances: Vec<Instance>,
+    instance_buffer: wgpu::Buffer,
+    render_targets: Vec<wgpu::Texture>,
+    output_buffers: Option<&'a Vec<wgpu::Buffer>>
+}
+
+impl<'a> MultiTargetRenderPipelineInstance<'a> {
+
+    pub fn new(graphicsProcessor: &GraphicsProcessor, canvas_dimensions : (usize, usize), common_instances: Vec<Instance>, instances_set: Vec<Vec<Instance>>, factory: &'a MultiTargetRenderPiplineFactory) -> MultiTargetRenderPipelineInstance<'a> {
+        let device = &graphicsProcessor.device;
+
+        assert!(instances_set.len() == factory.number_of_targets as usize);
+
+        let instances = common_instances.iter().chain(instances_set.iter().flatten()).cloned().collect::<Vec<_>>();
+
+        // add the common instances
+        // -1 means that the instance is in the common instances
+        let common_instances_it = common_instances.iter().map(|instance| InstanceRawMulti::to_raw(instance, -1));
+        
+        // create an empty instance buffer
+        // flatten the seperate instances and add the render target index
+        let individual_instances_data = 
+            instances_set.iter().enumerate()
+            .map(|(index, instances)| instances.iter().zip(std::iter::repeat(index))
+                .map(|(instance, index)| InstanceRawMulti::to_raw(instance, index as i32))
+            ).flatten();
+
+        let instances_data = common_instances_it
+            .chain(individual_instances_data)
+            .collect::<Vec<_>>();
+
+        let instance_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Instance Buffer"),
+                contents: &bytemuck::cast_slice(&instances_data),
+                usage: wgpu::BufferUsages::VERTEX,
+            }
+        );
+
+        let render_targets = (0..factory.number_of_targets).map(|_| graphicsProcessor.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: canvas_dimensions.0 as u32,
+                height: canvas_dimensions.1 as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+        })).collect::<Vec<_>>();
+ 
+        MultiTargetRenderPipelineInstance {
+            factory: &factory,
+            instances: instances,
+            instance_buffer: instance_buffer,
+            render_targets: render_targets,
+            output_buffers: None,
+        }
+    }
+
+    fn set_output_buffers(&mut self, output_buffers: &'a Vec<wgpu::Buffer>) {
+        self.output_buffers = Some(output_buffers);
+    }
+
+    fn get_render_targets(&self) -> &Vec<wgpu::Texture> {
+        &self.render_targets
+    }
+
+    pub fn add_to_encoder(&self, command_encoder: &mut wgpu::CommandEncoder) {
+        {
+            let texture_views = self.render_targets.iter().map(|render_target| render_target.create_view(&wgpu::TextureViewDescriptor::default())).collect::<Vec<_>>();
+
+            //setup the render targets
+            let color_attachments = texture_views.iter().map(|render_target_view| {Some(wgpu::RenderPassColorAttachment {
+                view: render_target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })}).collect::<Vec<_>>();
+
+            let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &color_attachments,
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            render_pass.set_pipeline(&self.factory.pipeline);
+            //add texture
+            render_pass.set_bind_group(0, &self.factory.textures_bind_group, &[]);
+            //add number of targets
+            render_pass.set_bind_group(1, &self.factory.number_of_targets_bind_group, &[]);
+            //add vertrices
+            render_pass.set_vertex_buffer(0, self.factory.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(self.factory.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            // set the instances
+            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+
+            render_pass.draw_indexed(0..INDICES.len() as u32, 0, 0..self.instances.len() as u32);
+        }
+
+        match self.output_buffers {
+            Some(output_buffers) => {
+                izip!(output_buffers, self.render_targets.iter()).for_each(|(output_buffer, render_target)| {
+                    command_encoder.copy_texture_to_buffer(
+                        wgpu::ImageCopyTexture {
+                            texture: &render_target,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::ImageCopyBuffer {
+                            buffer: output_buffer,
+                            layout: wgpu::ImageDataLayout {
+                                offset: 0,
+                                bytes_per_row: Some(4 * render_target.width()),
+                                rows_per_image: Some(render_target.height()),
+                            },
+                        },
+                        wgpu::Extent3d {
+                            width: render_target.width(),
+                            height: render_target.height(),
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                });
+            },
+            None => {}
+        }
+    }
+
+}
 
 
 struct RenderPiplineFactory {
@@ -917,6 +1260,9 @@ impl GraphicsProcessorBuilder{
             .request_adapter(&wgpu::RequestAdapterOptions::default())
             .await
             .unwrap();
+
+        println!("Adapter: {:?}", adapter.limits());
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -1259,6 +1605,7 @@ impl App{
             self.evolution_environment.rank_shapes(&scores);
             self.evolution_environment.cull_bad_shapes();
             self.evolution_environment.mutate_shapes_into_unranked_pool();
+            return;
         }
         // select best shape
         let best_shape = self.best_shape();
@@ -1291,115 +1638,125 @@ impl App{
         let render_pipeline_factory = RenderPiplineFactory::new(&self.graphics_processor, &image_textures);
         let texture_subtract_pipeline_factory = TextureSubtractPipelineFactory::new(&self.graphics_processor);
 
-        println!("Creating pipelines");
-        let (command_buffers, output_texture_views) = izip!(next_shapes.iter(), output_staging_buffers.iter())
-            .collect::<Vec<_>>()
-            .par_iter()
-            .map(|(new_shape, output_staging_buffer)| {
-                println!("Creating pipeline for shape");
-                let mut instances = vec![];
-                //add shapess
-                instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
-                //add new shape
-                instances.push(new_shape.create_instance().fix_scale(self.get_canvas_dimensions()));
+        let multi_target_render_pipeline_factory = MultiTargetRenderPiplineFactory::new(&self.graphics_processor, &image_textures, next_shapes.len() as u32);
+        
+        let common_instances = self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>();
 
-                println!("Creating render pipeline");
-                let mut renderPipeline = RenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), instances, &render_pipeline_factory);
-                //Uncomment to get the render target
-                renderPipeline.set_output_buffer(&output_staging_buffer);
-
-                let mut command_encoder =
-                    self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-
-                renderPipeline.add_to_encoder(&mut command_encoder);
-
-                // subtract from target image
-                let rendered_image = renderPipeline.get_render_target();
-                let target_image = self.create_target_texture();
-
-                //create storage texture to store difference in 
-                println!("Creating difference pipeline");
-                let subtractPipeline = TextureSubtractPipeline::new(&self.graphics_processor, &target_image, rendered_image, &texture_subtract_pipeline_factory);
-                subtractPipeline.add_to_encoder(&mut command_encoder);
-                subtractPipeline.copy_output_to_buffer(&mut command_encoder, output_staging_buffer);
-                let output_texture = subtractPipeline.output_texture;
-
-                let output_texture_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-                (command_encoder.finish(), output_texture_view)
-
-            }).unzip::<_, _, Vec<_>, Vec<_>>();
-
-        println!("Creating images");
-        queue.submit(command_buffers);
-            
-        // now combine those textures and perform the addition operation
+        let instances_set = next_shapes.iter().map(|shape| {
+            vec![shape.create_instance().fix_scale(self.get_canvas_dimensions())]
+        }).collect::<Vec<_>>();
+        
+        let mut multi_target_render_pipeline = MultiTargetRenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), common_instances, instances_set, &multi_target_render_pipeline_factory);
 
         let mut command_encoder =
             self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        {
-            let mut sumPipeline = SumTextureArrayPipeline::new(&self.graphics_processor, output_texture_views);
-            sumPipeline.add_to_encoder(&mut command_encoder);
-            sumPipeline.copy_output_to_buffer(&mut command_encoder, &output_sums_buffer);
-        }
-        println!("Summing images");
+
+        multi_target_render_pipeline.set_output_buffers(&output_staging_buffers);
+        multi_target_render_pipeline.add_to_encoder(&mut command_encoder);
+
+        // println!("Creating pipelines");
+        // let (command_buffers, output_texture_views) = izip!(next_shapes.iter(), output_staging_buffers.iter())
+        //     .collect::<Vec<_>>()
+        //     .par_iter()
+        //     .map(|(new_shape, output_staging_buffer)| {
+        //         println!("Creating pipeline for shape");
+        //         let mut instances = vec![];
+        //         //add shapess
+        //         instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
+        //         //add new shape
+        //         instances.push(new_shape.create_instance().fix_scale(self.get_canvas_dimensions()));
+
+        //         println!("Creating render pipeline");
+        //         let mut renderPipeline = RenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), instances, &render_pipeline_factory);
+        //         //Uncomment to get the render target
+        //         renderPipeline.set_output_buffer(&output_staging_buffer);
+
+        //         let mut command_encoder =
+        //             self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+        //         renderPipeline.add_to_encoder(&mut command_encoder);
+
+        //         // subtract from target image
+        //         let rendered_image = renderPipeline.get_render_target();
+        //         let target_image = self.create_target_texture();
+
+        //         //create storage texture to store difference in 
+        //         println!("Creating difference pipeline");
+        //         let subtractPipeline = TextureSubtractPipeline::new(&self.graphics_processor, &target_image, rendered_image, &texture_subtract_pipeline_factory);
+        //         subtractPipeline.add_to_encoder(&mut command_encoder);
+        //         subtractPipeline.copy_output_to_buffer(&mut command_encoder, output_staging_buffer);
+        //         let output_texture = subtractPipeline.output_texture;
+
+        //         let output_texture_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        //         (command_encoder.finish(), output_texture_view)
+
+        //     }).unzip::<_, _, Vec<_>, Vec<_>>();
+
+        // println!("Creating images");
+        // queue.submit(command_buffers);
+            
+        // // now combine those textures and perform the addition operation
+
+        // let mut command_encoder =
+        //     self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        // {
+        //     let mut sumPipeline = SumTextureArrayPipeline::new(&self.graphics_processor, output_texture_views);
+        //     sumPipeline.add_to_encoder(&mut command_encoder);
+        //     sumPipeline.copy_output_to_buffer(&mut command_encoder, &output_sums_buffer);
+        // }
+        // println!("Summing images");
         queue.submit(Some(command_encoder.finish()));
 
 
-
-        
-
-
-
-
-        let mut scores = vec![];
-
-        // for (i, output_staging_buffer) in output_staging_buffers.iter().enumerate() {
-        //     {
-        //         let mut texture_data = Vec::<u8>::with_capacity(canvas_dimensions.0 * canvas_dimensions.1 * 4);
-
-        //         // Time to get our image.
-        //         let buffer_slice = output_staging_buffer.slice(..);
-        //         let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
-        //         buffer_slice.map_async(wgpu::MapMode::Read, move |r| sender.send(r).unwrap());
-                
-        //         device.poll(wgpu::Maintain::Wait);
-        //         receiver.receive().await.unwrap().unwrap();
-        //         log::info!("Output buffer mapped.");
-        //         {
-        //             let view = buffer_slice.get_mapped_range();
-        //             texture_data.extend_from_slice(&view[..]);
-        //         }
-        //         log::info!("Image data copied to local.");
-    
-        //         #[cfg(not(target_arch = "wasm32"))]
-        //         let _path = _path.clone().unwrap().replace(".png", &format!("{}.png", i));
-        //         output_image_native(texture_data.to_vec(), canvas_dimensions, _path);
-        //         #[cfg(target_arch = "wasm32")]
-        //         output_image_wasm(texture_data.to_vec(), canvas_dimensions);
-        //         log::info!("Done.");
-        //     }
-        //     output_staging_buffer.unmap();
-        // }
-
-        {
-            let sum_slice = output_sums_buffer.slice(..);
-            let (sender2, reciever2) = futures_intrusive::channel::shared::oneshot_channel();
-            sum_slice.map_async(wgpu::MapMode::Read, move |r| sender2.send(r).unwrap());
-            
-            device.poll(wgpu::Maintain::Wait);
-            reciever2.receive().await.unwrap().unwrap();
-            log::info!("Output buffer mapped.");
+        for (i, output_staging_buffer) in output_staging_buffers.iter().enumerate() {
             {
-                let view = sum_slice.get_mapped_range();
-                let sum: &[f32] = bytemuck::cast_slice(&view);
-                for i in 0..sum.len() {
-                    log::info!("Sum: {}", sum[i]);
+                let mut texture_data = Vec::<u8>::with_capacity(canvas_dimensions.0 * canvas_dimensions.1 * 4);
+
+                // Time to get our image.
+                let buffer_slice = output_staging_buffer.slice(..);
+                let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+                buffer_slice.map_async(wgpu::MapMode::Read, move |r| sender.send(r).unwrap());
+                
+                device.poll(wgpu::Maintain::Wait);
+                receiver.receive().await.unwrap().unwrap();
+                log::info!("Output buffer mapped.");
+                {
+                    let view = buffer_slice.get_mapped_range();
+                    texture_data.extend_from_slice(&view[..]);
                 }
-                scores.extend_from_slice(sum);
+                log::info!("Image data copied to local.");
+    
+                #[cfg(not(target_arch = "wasm32"))]
+                let _path = _path.clone().unwrap().replace(".png", &format!("{}.png", i));
+                output_image_native(texture_data.to_vec(), canvas_dimensions, _path);
+                #[cfg(target_arch = "wasm32")]
+                output_image_wasm(texture_data.to_vec(), canvas_dimensions);
+                log::info!("Done.");
             }
+            output_staging_buffer.unmap();
         }
-        output_sums_buffer.unmap();
+
+        let mut scores = vec![0.0; next_shapes.len()];
+
+        // {
+        //     let sum_slice = output_sums_buffer.slice(..);
+        //     let (sender2, reciever2) = futures_intrusive::channel::shared::oneshot_channel();
+        //     sum_slice.map_async(wgpu::MapMode::Read, move |r| sender2.send(r).unwrap());
+            
+        //     device.poll(wgpu::Maintain::Wait);
+        //     reciever2.receive().await.unwrap().unwrap();
+        //     log::info!("Output buffer mapped.");
+        //     {
+        //         let view = sum_slice.get_mapped_range();
+        //         let sum: &[f32] = bytemuck::cast_slice(&view);
+        //         for i in 0..sum.len() {
+        //             log::info!("Sum: {}", sum[i]);
+        //         }
+        //         scores.extend_from_slice(sum);
+        //     }
+        // }
+        // output_sums_buffer.unmap();
 
         return scores;
     
@@ -1437,7 +1794,7 @@ async fn run(_path: Option<String>) {
         target_image_height: target_image.image.image.height(),
     };
 
-    let evolution_environment = EvolutionEnvironment::new(64, shaper, 2);
+    let evolution_environment = EvolutionEnvironment::new(8, shaper, 2);
 
     let mut app = App {
         graphics_processor: graphics_processor_builder.build().await,
