@@ -350,7 +350,7 @@ struct MultiTargetRenderPipelineInstance<'a> {
 
 impl<'a> MultiTargetRenderPipelineInstance<'a> {
 
-    pub fn new(graphicsProcessor: &GraphicsProcessor, canvas_dimensions : (usize, usize), common_instances: Vec<Instance>, instances_set: Vec<Vec<Instance>>, factory: &'a MultiTargetRenderPiplineFactory) -> MultiTargetRenderPipelineInstance<'a> {
+    pub fn new(graphicsProcessor: &GraphicsProcessor, canvas_dimensions : (usize, usize), common_instances: &Vec<Instance>, instances_set: Vec<Vec<Instance>>, factory: &'a MultiTargetRenderPiplineFactory) -> MultiTargetRenderPipelineInstance<'a> {
         let device = &graphicsProcessor.device;
 
         assert!(instances_set.len() == factory.number_of_targets as usize);
@@ -877,7 +877,7 @@ impl TextureSubtractPipelineFactory {
     }
 }
 
-struct TextureSubtractPipeline<'a> {
+struct   TextureSubtractPipeline<'a> {
     compute_pipeline: &'a wgpu::ComputePipeline,
     a_texture: &'a wgpu::Texture,
     b_texture: &'a wgpu::Texture,
@@ -1638,63 +1638,52 @@ impl App{
         let render_pipeline_factory = RenderPiplineFactory::new(&self.graphics_processor, &image_textures);
         let texture_subtract_pipeline_factory = TextureSubtractPipelineFactory::new(&self.graphics_processor);
 
-        let multi_target_render_pipeline_factory = MultiTargetRenderPiplineFactory::new(&self.graphics_processor, &image_textures, next_shapes.len() as u32);
+        let multi_target_render_pipeline_factory = MultiTargetRenderPiplineFactory::new(&self.graphics_processor, &image_textures, 8);
         
         let common_instances = self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>();
 
-        let instances_set = next_shapes.iter().map(|shape| {
-            vec![shape.create_instance().fix_scale(self.get_canvas_dimensions())]
+
+        println!("Creating pipelines");
+
+        let (mut command_buffers) = (0..next_shapes.len()).step_by(8).map(|j| {
+            println!("Rendering targets");
+            
+            let mut command_encoder =
+                self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+                let instances_set = next_shapes[j..j+8].iter().map(|shape| {
+                vec![shape.create_instance().fix_scale(self.get_canvas_dimensions())]
+            }).collect::<Vec<_>>();
+            
+            let mut multi_target_render_pipeline = MultiTargetRenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), &common_instances, instances_set, &multi_target_render_pipeline_factory);
+
+            multi_target_render_pipeline.add_to_encoder(&mut command_encoder);
+
+            let rendered_images = multi_target_render_pipeline.get_render_targets();
+            println!("Rendered targets");
+
+            // subtract from target image
+            let target_image = self.create_target_texture();
+
+            for (i, rendered_image) in rendered_images.iter().enumerate() {
+                println!("i: {}, j: {}", i, j);
+                let output_staging_buffer = &output_staging_buffers[i + j];
+
+                //create storage texture to store difference in 
+                println!("Creating difference pipeline");
+                let subtractPipeline = TextureSubtractPipeline::new(&self.graphics_processor, &target_image, rendered_image, &texture_subtract_pipeline_factory);
+                subtractPipeline.add_to_encoder(&mut command_encoder);
+                subtractPipeline.copy_output_to_buffer(&mut command_encoder, output_staging_buffer);
+                let output_texture = subtractPipeline.output_texture;
+
+                let output_texture_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            }
+
+            command_encoder.finish()
         }).collect::<Vec<_>>();
         
-        let mut multi_target_render_pipeline = MultiTargetRenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), common_instances, instances_set, &multi_target_render_pipeline_factory);
-
-        let mut command_encoder =
-            self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-
-        multi_target_render_pipeline.set_output_buffers(&output_staging_buffers);
-        multi_target_render_pipeline.add_to_encoder(&mut command_encoder);
-
-        // println!("Creating pipelines");
-        // let (command_buffers, output_texture_views) = izip!(next_shapes.iter(), output_staging_buffers.iter())
-        //     .collect::<Vec<_>>()
-        //     .par_iter()
-        //     .map(|(new_shape, output_staging_buffer)| {
-        //         println!("Creating pipeline for shape");
-        //         let mut instances = vec![];
-        //         //add shapess
-        //         instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
-        //         //add new shape
-        //         instances.push(new_shape.create_instance().fix_scale(self.get_canvas_dimensions()));
-
-        //         println!("Creating render pipeline");
-        //         let mut renderPipeline = RenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), instances, &render_pipeline_factory);
-        //         //Uncomment to get the render target
-        //         renderPipeline.set_output_buffer(&output_staging_buffer);
-
-        //         let mut command_encoder =
-        //             self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-
-        //         renderPipeline.add_to_encoder(&mut command_encoder);
-
-        //         // subtract from target image
-        //         let rendered_image = renderPipeline.get_render_target();
-        //         let target_image = self.create_target_texture();
-
-        //         //create storage texture to store difference in 
-        //         println!("Creating difference pipeline");
-        //         let subtractPipeline = TextureSubtractPipeline::new(&self.graphics_processor, &target_image, rendered_image, &texture_subtract_pipeline_factory);
-        //         subtractPipeline.add_to_encoder(&mut command_encoder);
-        //         subtractPipeline.copy_output_to_buffer(&mut command_encoder, output_staging_buffer);
-        //         let output_texture = subtractPipeline.output_texture;
-
-        //         let output_texture_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        //         (command_encoder.finish(), output_texture_view)
-
-        //     }).unzip::<_, _, Vec<_>, Vec<_>>();
-
-        // println!("Creating images");
-        // queue.submit(command_buffers);
+        println!("Creating images");
+        queue.submit(command_buffers);
             
         // // now combine those textures and perform the addition operation
 
@@ -1706,7 +1695,7 @@ impl App{
         //     sumPipeline.copy_output_to_buffer(&mut command_encoder, &output_sums_buffer);
         // }
         // println!("Summing images");
-        queue.submit(Some(command_encoder.finish()));
+        // queue.submit(Some(command_encoder.finish()));
 
 
         for (i, output_staging_buffer) in output_staging_buffers.iter().enumerate() {
@@ -1794,7 +1783,7 @@ async fn run(_path: Option<String>) {
         target_image_height: target_image.image.image.height(),
     };
 
-    let evolution_environment = EvolutionEnvironment::new(8, shaper, 2);
+    let evolution_environment = EvolutionEnvironment::new(16, shaper, 2);
 
     let mut app = App {
         graphics_processor: graphics_processor_builder.build().await,
