@@ -1104,13 +1104,15 @@ impl EvolutionEnvironment {
         //add to ranked shapes
         self.ranked_shapes.extend(&mut ranked_shapes);
 
+        //sort shapes based on lowest score
+        self.ranked_shapes.sort_by(|a, b| a.0.total_cmp(&b.0));
+
         //remove from unranked shapes
         self.unranked_shapes.clear();
     }
 
     pub fn cull_bad_shapes(&mut self) {
-        //sort shapes based on highest score
-        self.ranked_shapes.sort_by(|a, b| b.0.total_cmp(&a.0));
+       
         // keep only the best shapes
         let num_of_shapes_to_keep = ((self.shape_pool_size as f32) / (self.duplication_factor as f32)).ceil() as usize;
         self.ranked_shapes.truncate(num_of_shapes_to_keep);
@@ -1172,6 +1174,10 @@ impl App{
         self.evolution_environment.ranked_shapes[0].1.clone()
     }
 
+    fn best_shape_score(&self) -> f32 {
+        self.evolution_environment.ranked_shapes[0].0
+    }
+
     fn load_images(_path : String, upto : u32) -> Vec<Arc<ImageWrapper>> {
         let mut images = vec![];
         
@@ -1208,12 +1214,15 @@ impl App{
             }
             // select best shape
             let best_shape = self.best_shape();
+            println!("Best Shape Score: {}", self.best_shape_score());
             // add best shape to shapes
             self.shapes.push(best_shape);
         }
     }
 
     async fn run_round(&mut self, _path: Option<String>) -> Vec<f32> {
+        let canvas_dimensions = self.get_canvas_dimensions();
+        let device = &self.graphics_processor.device;
         let queue = &self.graphics_processor.queue;
         let render_pipeline_factory = &self.gpu_cache.render_pipeline_factory;
         let texture_subtract_pipeline_factory = &self.gpu_cache.texture_subtract_pipeline_factory;
@@ -1243,8 +1252,7 @@ impl App{
                 //Uncomment to get the render target
                 // renderPipeline.set_output_buffer(&output_staging_buffer);
 
-                let mut command_encoder =
-                    self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                let mut command_encoder = self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
                 renderPipeline.add_to_encoder(&mut command_encoder);
 
@@ -1296,45 +1304,38 @@ impl App{
         // }
 
 
-        let mut scores = vec![0.0; next_shapes.len()];
+        let mut scores = vec![];
 
-        // let output_sums_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        //     label: Some("Output Sum Buffer"),
-        //     size: (next_shapes.len() * std::mem::size_of::<f32>()) as u64,
-        //     usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        //     mapped_at_creation: false,
-        // });
+        let output_sums_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Output Sum Buffer"),
+            size: (next_shapes.len() * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
-        // let mut command_encoder =
-        //     self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        // {
-        //     let mut sumPipeline = SumTextureArrayPipeline::new(&self.graphics_processor, output_texture_views);
-        //     sumPipeline.add_to_encoder(&mut command_encoder);
-        //     sumPipeline.copy_output_to_buffer(&mut command_encoder, &output_sums_buffer);
-        // }
+        let mut command_encoder =
+            self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut sumPipeline = SumTextureArrayPipeline::new(&self.graphics_processor, output_texture_views);
+            sumPipeline.add_to_encoder(&mut command_encoder);
+            sumPipeline.copy_output_to_buffer(&mut command_encoder, &output_sums_buffer);
+        }
 
-        // println!("Summing images");
-        // queue.submit(Some(command_encoder.finish()));
-
-
-        // {
-        //     let sum_slice = output_sums_buffer.slice(..);
-        //     let (sender2, reciever2) = futures_intrusive::channel::shared::oneshot_channel();
-        //     sum_slice.map_async(wgpu::MapMode::Read, move |r| sender2.send(r).unwrap());
+        queue.submit(Some(command_encoder.finish()));
+        {
+            let sum_slice = output_sums_buffer.slice(..);
+            let (sender2, reciever2) = futures_intrusive::channel::shared::oneshot_channel();
+            sum_slice.map_async(wgpu::MapMode::Read, move |r| sender2.send(r).unwrap());
             
-        //     device.poll(wgpu::Maintain::Wait);
-        //     reciever2.receive().await.unwrap().unwrap();
-        //     log::info!("Output buffer mapped.");
-        //     {
-        //         let view = sum_slice.get_mapped_range();
-        //         let sum: &[f32] = bytemuck::cast_slice(&view);
-        //         for i in 0..sum.len() {
-        //             log::info!("Sum: {}", sum[i]);
-        //         }
-        //         scores.extend_from_slice(sum);
-        //     }
-        // }
-        // output_sums_buffer.unmap();
+            device.poll(wgpu::Maintain::Wait);
+            reciever2.receive().await.unwrap().unwrap();
+            {
+                let view = sum_slice.get_mapped_range();
+                let sum: &[f32] = bytemuck::cast_slice(&view);
+                scores = sum.into();
+            }
+        }
+        output_sums_buffer.unmap();
 
         return scores;
     
