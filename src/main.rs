@@ -1112,7 +1112,7 @@ impl EvolutionEnvironment {
         //sort shapes based on highest score
         self.ranked_shapes.sort_by(|a, b| b.0.total_cmp(&a.0));
         // keep only the best shapes
-        let num_of_shapes_to_keep = self.shape_pool_size / self.duplication_factor as usize;
+        let num_of_shapes_to_keep = ((self.shape_pool_size as f32) / (self.duplication_factor as f32)).ceil() as usize;
         self.ranked_shapes.truncate(num_of_shapes_to_keep);
     }
 
@@ -1133,6 +1133,7 @@ struct App {
     pub images: Vec<Arc<ImageWrapper>>,
     pub target_image: Graphic2D,
     pub shapes: Vec<Graphic2D>,
+    pub number_of_shapes: usize,
     pub evolution_environment: EvolutionEnvironment,
     pub rounds: u32,
     pub gpu_cache: GpuCached,
@@ -1155,6 +1156,7 @@ impl App{
             images,
             target_image,
             shapes: vec![],
+            number_of_shapes: 10,
             evolution_environment,
             rounds,
             gpu_cache
@@ -1193,17 +1195,22 @@ impl App{
     async fn run(&mut self, _path: Option<String>) {
         self.evolution_environment.setup_pool();
 
-        for round in 0..self.rounds {
-            println!("Round: {}", round);
-            let scores = self.run_round(_path.clone()).await;
-            self.evolution_environment.rank_shapes(&scores);
-            self.evolution_environment.cull_bad_shapes();
-            self.evolution_environment.mutate_shapes_into_unranked_pool();
+        for shape_count in 0..self.number_of_shapes {
+            println!("Shape: {}", shape_count);
+            // run rounds
+
+            for round in 0..self.rounds {
+                println!("Round: {}", round);
+                let scores = self.run_round(_path.clone()).await;
+                self.evolution_environment.rank_shapes(&scores);
+                self.evolution_environment.cull_bad_shapes();
+                self.evolution_environment.mutate_shapes_into_unranked_pool();
+            }
+            // select best shape
+            let best_shape = self.best_shape();
+            // add best shape to shapes
+            self.shapes.push(best_shape);
         }
-        // select best shape
-        let best_shape = self.best_shape();
-        // add best shape to shapes
-        self.shapes.push(best_shape);
     }
 
     async fn run_round(&mut self, _path: Option<String>) -> Vec<f32> {
@@ -1222,23 +1229,16 @@ impl App{
         //         mapped_at_creation: false,
         //     })}).collect::<Vec<_>>();
 
-        log::info!("Creating render pipeline factory");
-
-
-
-        println!("Creating pipelines");
         let (command_buffers, output_texture_views) = izip!(next_shapes.iter())
             .collect::<Vec<_>>()
             .par_iter()
             .map(|(new_shape)| {
-                println!("Creating pipeline for shape");
                 let mut instances = vec![];
                 //add shapess
                 instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
                 //add new shape
                 instances.push(new_shape.create_instance().fix_scale(self.get_canvas_dimensions()));
 
-                println!("Creating render pipeline");
                 let mut renderPipeline = RenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), instances, render_pipeline_factory);
                 //Uncomment to get the render target
                 // renderPipeline.set_output_buffer(&output_staging_buffer);
@@ -1252,7 +1252,6 @@ impl App{
                 let rendered_image = renderPipeline.get_render_target();
 
                 //create storage texture to store difference in 
-                println!("Creating difference pipeline");
                 let subtractPipeline = TextureSubtractPipeline::new(&self.graphics_processor, target_image, rendered_image, texture_subtract_pipeline_factory);
                 subtractPipeline.add_to_encoder(&mut command_encoder);
                 // subtractPipeline.copy_output_to_buffer(&mut command_encoder, output_staging_buffer);
@@ -1264,7 +1263,6 @@ impl App{
 
             }).unzip::<_, _, Vec<_>, Vec<_>>();
 
-        println!("Creating images");
         queue.submit(command_buffers);
             
         // now combine those textures and perform the addition operation
@@ -1437,7 +1435,7 @@ async fn run(_path: Option<String>) {
         target_image_height: target_image.image.image.height(),
     };
 
-    let evolution_environment = EvolutionEnvironment::new(512, shaper, 2);
+    let evolution_environment = EvolutionEnvironment::new(100, shaper, 2);
 
     let mut app = App::new( 
         graphics_processor_builder.build().await, 
