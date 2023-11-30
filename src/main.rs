@@ -1,22 +1,33 @@
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::hash::Hasher;
+use std::mem::{MaybeUninit, self};
+use std::rc::Rc;
 use std::{num::NonZeroU32, future};
+use itertools::multiunzip; 
 
 //include arc
 use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
 use genetic_image_creator::wgpu_utils::output_image_native;
+use opentelemetry::ExportError;
+use opentelemetry::global::{ObjectSafeSpan, BoxedSpan};
+use opentelemetry::trace::Span;
+use opentelemetry_sdk::trace::TracerProvider;
 use rand::Rng;
 use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator, IntoParallelIterator};
-use wgpu::BindingResource;
+use wgpu::{BindingResource, Texture};
 use wgpu::{Features, Limits, BindGroup, Queue, Device, BindGroupLayout, util::DeviceExt, TextureView};
 #[cfg(target_arch = "wasm32")]
 use wgpu_example::utils::output_image_wasm;
-
+use opentelemetry::{global, trace::{TraceContextExt, Tracer, TracerProvider as _}, Context, ContextGuard };
 use cgmath;
 use cgmath::prelude::*;
+use opentelemetry_auto_span::auto_span;
 
 use bytemuck;
-use itertools::{izip};
+use itertools::{izip, Itertools};
 
 // include the repr C
 
@@ -137,18 +148,76 @@ const INDICES: &[u16] = &[
     0, 1, 3, // second triangle
 ];
 
+struct TextureFactory {
+    created_textures : std::collections::HashMap<u64, Vec<Rc<wgpu::Texture>>>,
+}
+
+impl TextureFactory {
+    pub fn new() -> TextureFactory {
+        TextureFactory {
+            created_textures: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn create_texture(&mut self, texture_descriptor : wgpu::TextureDescriptor, device: &Device) -> Rc<wgpu::Texture> {
+        //hash texture descriptor
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&texture_descriptor, &mut hasher);
+        let hash = hasher.finish();
+
+
+
+        // if matching hash return texture removing it from the map
+        if let Some(textures) = self.created_textures.get_mut(&hash) {
+            if let Some(texture) = textures.pop() {
+                return texture;
+            } else {
+                // create texture and return it
+                Rc::new(device.create_texture(&texture_descriptor))
+            }
+        } else {
+            // create texture and return it
+            Rc::new(device.create_texture(&texture_descriptor))
+        }
+    }
+
+    pub fn add_texture(&mut self, texture: Rc<wgpu::Texture>) {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        //make the texture descriptor corresponding to the texture
+        let texture_descriptor = wgpu::TextureDescriptor {
+            label: None,
+            size: texture.size(),
+            mip_level_count: texture.mip_level_count(),
+            sample_count: texture.sample_count(),
+            dimension: texture.dimension(),
+            format: texture.format(),
+            usage: texture.usage(),
+            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+        };
+
+        std::hash::Hash::hash(&texture_descriptor, &mut hasher);
+        let hash = hasher.finish();
+        if let Some(textures) = self.created_textures.get_mut(&hash) {
+            textures.push(texture);
+        } else {
+            self.created_textures.insert(hash, vec![texture]);
+        }
+    }
+}
+
 
 struct RenderPiplineFactory {
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     textures_bind_group: wgpu::BindGroup,
+    texture_factory: Rc<RefCell<TextureFactory>>,
 }
 
 impl RenderPiplineFactory {
-    pub fn new(graphicsProcessor: &GraphicsProcessor, images: &Vec<DynamicImage>) -> RenderPiplineFactory {
-        let device = &graphicsProcessor.device;
-        let queue = &graphicsProcessor.queue;
+    pub fn new(graphics_processor: &GraphicsProcessor, images: &Vec<DynamicImage>, texture_factory : Rc<RefCell<TextureFactory>>) -> RenderPiplineFactory {
+        let device = &graphics_processor.device;
+        let queue = &graphics_processor.queue;
 
         let vertex_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
@@ -221,7 +290,32 @@ impl RenderPiplineFactory {
             vertex_buffer,
             index_buffer,
             textures_bind_group,
+            texture_factory,
         }
+    }
+
+    fn load_texture_factory(&self, graphics_processor: &GraphicsProcessor, expected_concurrent_instances: u32, width: u32, height:u32) {
+        for _ in 0..expected_concurrent_instances {
+            let texture_descriptor = wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: width,
+                    height: height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+            };
+
+            let texture = graphics_processor.device.create_texture(&texture_descriptor);
+
+            self.texture_factory.borrow_mut().add_texture(Rc::new(texture));
+        }
+
     }
 
     fn create_textures_bind_group(device: &Device, queue: &Queue, images: &Vec<DynamicImage>) -> (BindGroup, BindGroupLayout, Vec<TextureView>) {
@@ -352,15 +446,17 @@ struct RenderPipelineInstance<'a> {
     factory: &'a RenderPiplineFactory,
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
-    render_target: wgpu::Texture,
+    render_target: Rc<wgpu::Texture>,
     output_buffer: Option<&'a wgpu::Buffer>
 }
 
 impl<'a> RenderPipelineInstance<'a> {
 
-    pub fn new(graphicsProcessor: &GraphicsProcessor, canvas_dimensions : (usize, usize), instances: Vec<Instance>, factory: &'a RenderPiplineFactory) -> RenderPipelineInstance<'a> {
-        let device = &graphicsProcessor.device;
+    pub fn new(graphics_processor: &GraphicsProcessor, canvas_dimensions : (usize, usize), instances: Vec<Instance>, factory: &'a RenderPiplineFactory) -> RenderPipelineInstance<'a> {
+        let _render_pipleline_instance_creation_guard = create_span_and_active_context("render_pipeline_instance_creation");
+        let device = &graphics_processor.device;
         // create an empty instance buffer
+        let _instance_buffer_creation_guard = create_span_and_active_context("instance_buffer_creation");
         let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
         let instance_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
@@ -369,8 +465,11 @@ impl<'a> RenderPipelineInstance<'a> {
                 usage: wgpu::BufferUsages::VERTEX,
             }
         );
+        drop(_instance_buffer_creation_guard);
 
-        let render_target = graphicsProcessor.device.create_texture(&wgpu::TextureDescriptor {
+
+        let _render_target_creation_guard = create_span_and_active_context("render_target_creation");    
+        let texture_descriptor = wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {
                 width: canvas_dimensions.0 as u32,
@@ -383,7 +482,10 @@ impl<'a> RenderPipelineInstance<'a> {
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
-        });
+        };
+
+        let render_target = factory.texture_factory.borrow_mut().create_texture(texture_descriptor, device);
+        drop(_render_pipleline_instance_creation_guard);
  
         RenderPipelineInstance {
             factory: &factory,
@@ -406,6 +508,7 @@ impl<'a> RenderPipelineInstance<'a> {
         let render_texture_view = self.render_target.create_view(&wgpu::TextureViewDescriptor::default());
 
         {
+            let _guard = create_span_and_active_context("render_pass");
             let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -465,11 +568,12 @@ type OwnedBuf<'a> = Option<(&'a wgpu::Buffer, Option<wgpu::Buffer>)>;
 struct TextureSubtractPipelineFactory {
     compute_pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    texture_factory: Rc<RefCell<TextureFactory>>,
 }
 
 impl TextureSubtractPipelineFactory {
-    pub fn new(graphicsProcessor: &GraphicsProcessor) -> TextureSubtractPipelineFactory {
-        let device = &graphicsProcessor.device;
+    pub fn new(graphics_processor: &GraphicsProcessor, texture_factory: Rc<RefCell<TextureFactory>>) -> TextureSubtractPipelineFactory {
+        let device = &graphics_processor.device;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
@@ -530,24 +634,51 @@ impl TextureSubtractPipelineFactory {
         TextureSubtractPipelineFactory {
             compute_pipeline: pipeline,
             bind_group_layout: bind_group_layout,
+            texture_factory
         }
     }
+
+    fn load_texture_factory(&self, graphics_processor: &GraphicsProcessor, expected_concurrent_instances: u32, width: u32, height:u32) {
+        for _ in 0..expected_concurrent_instances {
+            let texture_descriptor = wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: width,
+                    height: height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+            };
+
+            let texture = graphics_processor.device.create_texture(&texture_descriptor);
+
+            self.texture_factory.borrow_mut().add_texture(Rc::new(texture));
+        }
+
+    }
+
 }
 
 struct TextureSubtractPipeline<'a> {
     compute_pipeline: &'a wgpu::ComputePipeline,
     a_texture: &'a wgpu::Texture,
     b_texture: &'a wgpu::Texture,
-    output_texture: wgpu::Texture,
+    output_texture: Rc<wgpu::Texture>,
     bind_group: wgpu::BindGroup,
 }
 
 impl<'a> TextureSubtractPipeline<'a> {
-    pub fn new(graphicsProcessor: &GraphicsProcessor, a_texture: &'a wgpu::Texture, b_texture: &'a wgpu::Texture, factory: &'a TextureSubtractPipelineFactory) -> TextureSubtractPipeline<'a> {
-        let device = &graphicsProcessor.device;
-        let queue = &graphicsProcessor.queue;
+    pub fn new(graphics_processor: &GraphicsProcessor, a_texture: &'a wgpu::Texture, b_texture: &'a wgpu::Texture, factory: &'a TextureSubtractPipelineFactory) -> TextureSubtractPipeline<'a> {
+        let device = &graphics_processor.device;
+        let queue = &graphics_processor.queue;
 
-        let output_texture = device.create_texture(&wgpu::TextureDescriptor {
+        let _guard_output_texture_creation = create_span_and_active_context("output_texture_creation");
+        let output_texture = factory.texture_factory.borrow_mut().create_texture(wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {
                 width: a_texture.width(),
@@ -560,10 +691,12 @@ impl<'a> TextureSubtractPipeline<'a> {
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
             view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
-        });
+        }, device);
+        drop(_guard_output_texture_creation);
 
         let bind_group_layout = &factory.bind_group_layout;
 
+        let _guard_bind_group_creation = create_span_and_active_context("bind_group_creation");
         let bind_group = device.create_bind_group(
             &wgpu::BindGroupDescriptor {
                 layout: &bind_group_layout,
@@ -584,16 +717,13 @@ impl<'a> TextureSubtractPipeline<'a> {
                 label: Some("compute_bind_group")
             }
         );
-
-
-
- 
+        drop(_guard_bind_group_creation);
 
         TextureSubtractPipeline {
             compute_pipeline: &factory.compute_pipeline,
             a_texture: a_texture,
             b_texture: b_texture,
-            output_texture: output_texture,
+            output_texture,
             bind_group,
         }
     }
@@ -1142,14 +1272,16 @@ struct App {
 }
 
 impl App{
-    pub fn new(graphics_processor: GraphicsProcessor, images: Vec<Arc<ImageWrapper>>, target_image: Graphic2D, evolution_environment: EvolutionEnvironment, rounds: u32) -> App {
+    pub fn new(graphics_processor: GraphicsProcessor, images: Vec<Arc<ImageWrapper>>, target_image: Graphic2D, evolution_environment: EvolutionEnvironment, rounds: u32, number_of_shapes: usize) -> App {
         let image_textures = images.iter().map(|image| image.image.clone()).collect::<Vec<_>>();
         let target_image_texture = target_image.get_image().image.clone();
         let queue = &graphics_processor.queue;
 
+        let texture_factory = Rc::new(RefCell::new(TextureFactory::new()));
+
         let gpu_cache = GpuCached {
-            render_pipeline_factory: RenderPiplineFactory::new(&graphics_processor, &image_textures),
-            texture_subtract_pipeline_factory: TextureSubtractPipelineFactory::new(&graphics_processor),
+            render_pipeline_factory: RenderPiplineFactory::new(&graphics_processor, &image_textures, texture_factory.clone()),
+            texture_subtract_pipeline_factory: TextureSubtractPipelineFactory::new(&graphics_processor, texture_factory),
             target_texture: App::create_target_texture(&target_image_texture, &graphics_processor.device, queue),
         };
 
@@ -1158,7 +1290,7 @@ impl App{
             images,
             target_image,
             shapes: vec![],
-            number_of_shapes: 10,
+            number_of_shapes,
             evolution_environment,
             rounds,
             gpu_cache
@@ -1198,12 +1330,17 @@ impl App{
         self.shapes.extend(new_shapes);
     }
 
+    // #[auto_span]
     async fn run(&mut self, _path: Option<String>) {
         self.evolution_environment.setup_pool();
+
+        let _guard = create_span_and_active_context("run");
 
         for shape_count in 0..self.number_of_shapes {
             println!("Shape: {}", shape_count);
             // run rounds
+
+            let _guard_round = create_span_and_active_context("rounds");
 
             for round in 0..self.rounds {
                 println!("Round: {}", round);
@@ -1222,13 +1359,18 @@ impl App{
 
     async fn run_round(&mut self, _path: Option<String>) -> Vec<f32> {
         let canvas_dimensions = self.get_canvas_dimensions();
+        let width = canvas_dimensions.0 as u32;
+        let height = canvas_dimensions.1 as u32;
+        let next_shapes = self.evolution_environment.get_unranked_shapes();
+        let expected_concurrent_instances = next_shapes.len() as u32;
         let device = &self.graphics_processor.device;
         let queue = &self.graphics_processor.queue;
-        let render_pipeline_factory = &self.gpu_cache.render_pipeline_factory;
-        let texture_subtract_pipeline_factory = &self.gpu_cache.texture_subtract_pipeline_factory;
+        let mut render_pipeline_factory = &self.gpu_cache.render_pipeline_factory;
+        render_pipeline_factory.load_texture_factory(&self.graphics_processor, expected_concurrent_instances, width, height);
+        let mut texture_subtract_pipeline_factory = &self.gpu_cache.texture_subtract_pipeline_factory;
+        texture_subtract_pipeline_factory.load_texture_factory(&self.graphics_processor, expected_concurrent_instances, width, height);
         let target_image = &self.gpu_cache.target_texture;
 
-        let next_shapes = self.evolution_environment.get_unranked_shapes();
 
         // let output_staging_buffers = next_shapes.iter().map(|_| {
         //     device.create_buffer(&wgpu::BufferDescriptor {
@@ -1238,16 +1380,23 @@ impl App{
         //         mapped_at_creation: false,
         //     })}).collect::<Vec<_>>();
 
-        let (command_buffers, output_texture_views) = izip!(next_shapes.iter())
-            .collect::<Vec<_>>()
-            .par_iter()
+        let _guard = create_span_and_active_context("create command buffers");
+
+        let (command_buffers, output_texture_views, render_pipelines) : (Vec<_>, Vec<_>, Vec<_>)  = multiunzip(izip!(next_shapes.iter())
+            // .collect::<Vec<_>>()
+            // .par_iter()
             .map(|(new_shape)| {
+
+
+                let command_buffer_guard = create_span_and_active_context("create command buffer");
+
                 let mut instances = vec![];
                 //add shapess
                 instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
                 //add new shape
                 instances.push(new_shape.create_instance().fix_scale(self.get_canvas_dimensions()));
 
+                let render_pipeline_guard = create_span_and_active_context("render_pipeline");
                 let mut renderPipeline = RenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), instances, render_pipeline_factory);
                 //Uncomment to get the render target
                 // renderPipeline.set_output_buffer(&output_staging_buffer);
@@ -1256,9 +1405,12 @@ impl App{
 
                 renderPipeline.add_to_encoder(&mut command_encoder);
 
+                drop(render_pipeline_guard);
+
                 // subtract from target image
                 let rendered_image = renderPipeline.get_render_target();
 
+                let subtract_pipeline_guard = create_span_and_active_context("subtract_pipeline");
                 //create storage texture to store difference in 
                 let subtractPipeline = TextureSubtractPipeline::new(&self.graphics_processor, target_image, rendered_image, texture_subtract_pipeline_factory);
                 subtractPipeline.add_to_encoder(&mut command_encoder);
@@ -1267,11 +1419,17 @@ impl App{
 
                 let output_texture_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-                (command_encoder.finish(), output_texture_view)
+                drop(subtract_pipeline_guard);
 
-            }).unzip::<_, _, Vec<_>, Vec<_>>();
+                drop(command_buffer_guard);
 
-        queue.submit(command_buffers);
+                (command_encoder.finish(), output_texture_view, renderPipeline)
+            }));
+        drop(_guard);
+        {
+            let _guard = create_span_and_active_context("submit command buffers");
+            queue.submit(command_buffers);
+        }
             
         // now combine those textures and perform the addition operation
 
@@ -1338,8 +1496,6 @@ impl App{
         output_sums_buffer.unmap();
 
         return scores;
-    
-    
     }
 
     fn create_target_texture(image: &DynamicImage, device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Texture {
@@ -1408,9 +1564,13 @@ struct GpuCached {
 }
 
 async fn run(_path: Option<String>) {
+    let pool_size = 100;
+    let rounds = 10;
+    let number_of_images = 2;
+
+
 
     let mut graphics_processor_builder = GraphicsProcessorBuilder::new();
-
 
     let target_image_image = Arc::new(ImageWrapper {
         image: image::open("./assets/targets/grapes.jpg").unwrap(),
@@ -1436,14 +1596,15 @@ async fn run(_path: Option<String>) {
         target_image_height: target_image.image.image.height(),
     };
 
-    let evolution_environment = EvolutionEnvironment::new(100, shaper, 2);
+    let evolution_environment = EvolutionEnvironment::new(pool_size, shaper, 2);
 
     let mut app = App::new( 
         graphics_processor_builder.build().await, 
         images.clone(), 
         target_image, 
         evolution_environment, 
-        10);
+        rounds,
+        number_of_images);
 
     let shape1 = Graphic2D::new(0.0, 0.0, 0.0, app.images[1].clone(), 1.0);
     let shape2 = Graphic2D::new(0.5, 0.0, 30.0, app.images[2].clone(), 1.0);
@@ -1451,6 +1612,38 @@ async fn run(_path: Option<String>) {
   
 
     app.run(_path).await;
+
+}
+
+//create macro to create span
+fn create_span<T>(name: T) -> BoxedSpan
+where
+T: Into<Cow<'static, str>>,
+{
+    global::tracer("").start(name)
+}
+
+fn create_span_and_active_context<T>(name: T) -> (ContextGuard)
+where
+T: Into<Cow<'static, str>>,
+{
+    let span = create_span(name);
+    let cx = Context::current_with_span(span);
+    let guard = Context::attach(cx);
+    (guard)
+}
+
+fn end_span(mut span: BoxedSpan) {
+    ObjectSafeSpan::end(&mut span)
+}
+
+async fn run_logger(path : Option<String>) {
+    global::set_text_map_propagator(opentelemetry_jaeger::Propagator::new());
+    let tracer = opentelemetry_jaeger::new_agent_pipeline().with_service_name("genetic-image-creator").install_simple().unwrap();
+
+    run(path).await;
+
+    global::shutdown_tracer_provider();
 }
 
 fn main() {
@@ -1464,7 +1657,7 @@ fn main() {
         let path = std::env::args()
             .nth(1)
             .unwrap_or_else(|| "please_don't_git_push_me.png".to_string());
-        pollster::block_on(run(Some(path)));
+        pollster::block_on(run_logger(Some(path)));
     }
     #[cfg(target_arch = "wasm32")]
     {
