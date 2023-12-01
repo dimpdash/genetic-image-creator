@@ -4,6 +4,7 @@ use std::hash::Hasher;
 
 use std::rc::Rc;
 use std::num::NonZeroU32;
+use genetic_image_creator::wgpu_utils::output_image_native;
 use itertools::multiunzip; 
 
 //include arc
@@ -205,22 +206,15 @@ impl TextureFactory {
 
 
 pub struct RenderPiplineFactory {
-    //ownership
-    #[allow(dead_code)]
     pipeline: wgpu::RenderPipeline,
-    #[allow(dead_code)]
     vertex_buffer: wgpu::Buffer,
-    #[allow(dead_code)]
     index_buffer: wgpu::Buffer,
-    #[allow(dead_code)]
     textures_bind_group: wgpu::BindGroup,
-    instance_buffer: wgpu::Buffer,
     texture_factory: Rc<RefCell<TextureFactory>>,
-    render_bundle: wgpu::RenderBundle,
 }
 
 impl RenderPiplineFactory {
-    pub fn new(graphics_processor: &GraphicsProcessor, images: &Vec<DynamicImage>, texture_factory : Rc<RefCell<TextureFactory>>, max_instances : u64) -> RenderPiplineFactory {
+    pub fn new(graphics_processor: &GraphicsProcessor, images: &Vec<DynamicImage>, texture_factory : Rc<RefCell<TextureFactory>>) -> RenderPiplineFactory {
         let device = &graphics_processor.device;
         let queue = &graphics_processor.queue;
 
@@ -238,24 +232,6 @@ impl RenderPiplineFactory {
                 usage: wgpu::BufferUsages::INDEX,
             }
         );
-
-        // create place holder instances
-        let instances = (0..max_instances)
-            .map(|_| Instance {
-                // creating an instance at (0.0, 0.0) makes it not be rendered
-                position: cgmath::Vector3::new(0.0, 0.0, 0.0),
-                rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0)),
-                scale: cgmath::Vector3::new(1.0, 1.0, 1.0),
-                texture_index: 0,
-                post_scale: cgmath::Vector3::new(1.0, 1.0, 1.0),})
-            .map(|instance| instance.to_raw())
-            .collect::<Vec<_>>();
-
-        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Instance Buffer"),
-            contents: bytemuck::cast_slice(&instances),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
@@ -308,39 +284,13 @@ impl RenderPiplineFactory {
         });
 
 
-        // create the render bundle
-        let mut render_bundle_encoder = device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
-            label: Some("render_bundle_encoder"),
-            color_formats: &[Some(wgpu::TextureFormat::Rgba8Unorm)],
-            sample_count: 1,
-            depth_stencil: None,
-            multiview: None,
-        });
-
-        render_bundle_encoder.set_pipeline(&pipeline);
-        //add texture
-        render_bundle_encoder.set_bind_group(0, &textures_bind_group, &[]);
-        //add vertrices
-        render_bundle_encoder.set_vertex_buffer(0, vertex_buffer.slice(..));
-        render_bundle_encoder.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-        // set the instances
-        render_bundle_encoder.set_vertex_buffer(0, instance_buffer.slice(..));
-        // draw call
-        render_bundle_encoder.draw_indexed(0..INDICES.len() as u32, 0, 0..max_instances as u32);
-
-
-        let render_bundle = render_bundle_encoder.finish(&wgpu::RenderBundleDescriptor {
-            label: Some("render_bundle"),
-        });
 
         RenderPiplineFactory {
             pipeline,
             vertex_buffer,
             index_buffer,
             textures_bind_group,
-            instance_buffer,
             texture_factory,
-            render_bundle,    
         }
     }
 
@@ -493,9 +443,10 @@ impl RenderPiplineFactory {
 }
 
 pub struct RenderPipelineInstance<'a> {
-    factory: &'a RenderPiplineFactory,
+    instance_buffer : wgpu::Buffer,
     render_target: Rc<wgpu::Texture>,
-    output_buffer: Option<&'a wgpu::Buffer>
+    output_buffer: Option<&'a wgpu::Buffer>,
+    render_bundle: wgpu::RenderBundle,
 }
 
 impl<'a> RenderPipelineInstance<'a> {
@@ -503,12 +454,15 @@ impl<'a> RenderPipelineInstance<'a> {
     pub fn new(graphics_processor: &GraphicsProcessor, canvas_dimensions : (usize, usize), instances: Vec<Instance>, factory: &'a RenderPiplineFactory) -> RenderPipelineInstance<'a> {
         let _render_pipleline_instance_creation_guard = create_span_and_active_context("render_pipeline_instance_creation");
         let device = &graphics_processor.device;
-        let queue = &graphics_processor.queue;
 
-        //overwrite data in the instance buffer
         let _instance_buffer_creation_guard = create_span_and_active_context("instance_buffer_update");
-        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
-        queue.write_buffer(&factory.instance_buffer, 0, bytemuck::cast_slice(&instance_data));
+        let instance_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Instance Buffer"),
+                contents: bytemuck::cast_slice(&instances.iter().map(Instance::to_raw).collect::<Vec<_>>()),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            }
+        );
 
         drop(_instance_buffer_creation_guard);
 
@@ -532,11 +486,43 @@ impl<'a> RenderPipelineInstance<'a> {
         let render_target = factory.texture_factory.borrow_mut().create_texture(texture_descriptor, device);
         drop(_render_pipleline_instance_creation_guard);
  
+
+        // create the render bundle
+        let mut render_bundle_encoder = device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
+            label: Some("render_bundle_encoder"),
+            color_formats: &[Some(wgpu::TextureFormat::Rgba8Unorm)],
+            sample_count: 1,
+            depth_stencil: None,
+            multiview: None,
+        });
+
+        render_bundle_encoder.set_pipeline(&factory.pipeline);
+        //add texture
+        render_bundle_encoder.set_bind_group(0, &factory.textures_bind_group, &[]);
+        //add vertrices
+        render_bundle_encoder.set_vertex_buffer(0, factory.vertex_buffer.slice(..));
+        render_bundle_encoder.set_index_buffer(factory.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+        // set the instances
+        render_bundle_encoder.set_vertex_buffer(1, instance_buffer.slice(..));
+        // draw call
+        render_bundle_encoder.draw_indexed(0..INDICES.len() as u32, 0, 0..instances.len() as u32);
+
+
+        let render_bundle = render_bundle_encoder.finish(&wgpu::RenderBundleDescriptor {
+            label: Some("render_bundle"),
+        });
+
         RenderPipelineInstance {
-            factory,
             render_target,
             output_buffer: None,
+            instance_buffer,
+            render_bundle,
         }
+    }
+
+    pub fn set_instances(&self, queue: &wgpu::Queue, instances: &Vec<Instance>) {
+        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
+        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instance_data));
     }
 
     pub fn set_output_buffer(&mut self, output_buffer: &'a wgpu::Buffer) {
@@ -565,7 +551,7 @@ impl<'a> RenderPipelineInstance<'a> {
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
                 timestamp_writes: None,
-            }).execute_bundles([&self.factory.render_bundle]);
+            }).execute_bundles([&self.render_bundle]);
         }
 
         if let Some(output_buffer) = self.output_buffer {
@@ -1311,7 +1297,7 @@ impl App{
         let texture_factory = Rc::new(RefCell::new(TextureFactory::new()));
 
         let gpu_cache = GpuCached {
-            render_pipeline_factory: RenderPiplineFactory::new(&graphics_processor, &image_textures, texture_factory.clone(), number_of_shapes as u64),
+            render_pipeline_factory: RenderPiplineFactory::new(&graphics_processor, &image_textures, texture_factory.clone()),
             texture_subtract_pipeline_factory: TextureSubtractPipelineFactory::new(&graphics_processor, texture_factory),
             target_texture: App::create_target_texture(&target_image_texture, &graphics_processor.device, queue),
         };
@@ -1403,20 +1389,20 @@ impl App{
         let target_image = &self.gpu_cache.target_texture;
 
 
-        // let output_staging_buffers = next_shapes.iter().map(|_| {
-        //     device.create_buffer(&wgpu::BufferDescriptor {
-        //         label: (Some("Output Staging Buffer")),
-        //         size: (std::mem::size_of::<f32>() * canvas_dimensions.0 * canvas_dimensions.1) as u64,
-        //         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        //         mapped_at_creation: false,
-        //     })}).collect::<Vec<_>>();
+        let output_staging_buffers = next_shapes.iter().map(|_| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: (Some("Output Staging Buffer")),
+                size: (std::mem::size_of::<f32>() * canvas_dimensions.0 * canvas_dimensions.1) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })}).collect::<Vec<_>>();
 
         let _guard = create_span_and_active_context("create command buffers");
 
-        let (command_buffers, output_texture_views, _render_pipelines) : (Vec<_>, Vec<_>, Vec<_>)  = multiunzip(izip!(next_shapes.iter())
+        let (command_buffers, output_texture_views, _render_pipelines) : (Vec<_>, Vec<_>, Vec<_>)  = multiunzip(izip!(next_shapes.iter(), output_staging_buffers.iter())
             // .collect::<Vec<_>>()
             // .par_iter()
-            .map(|new_shape| {
+            .map(|(new_shape, output_staging_buffer)| {
 
 
                 let command_buffer_guard = create_span_and_active_context("create command buffer");
@@ -1428,9 +1414,9 @@ impl App{
                 instances.push(new_shape.create_instance().fix_scale(self.get_canvas_dimensions()));
 
                 let render_pipeline_guard = create_span_and_active_context("render_pipeline");
-                let render_pipeline = RenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), instances, render_pipeline_factory);
+                let mut render_pipeline = RenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), instances, render_pipeline_factory);
                 //Uncomment to get the render target
-                // renderPipeline.set_output_buffer(&output_staging_buffer);
+                render_pipeline.set_output_buffer(&output_staging_buffer);
 
                 let mut command_encoder = self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
@@ -1464,33 +1450,33 @@ impl App{
             
         // now combine those textures and perform the addition operation
 
-        // for (i, output_staging_buffer) in output_staging_buffers.iter().enumerate() {
-        //     {
-        //         let mut texture_data = Vec::<u8>::with_capacity(canvas_dimensions.0 * canvas_dimensions.1 * 4);
+        for (i, output_staging_buffer) in output_staging_buffers.iter().enumerate() {
+            {
+                let mut texture_data = Vec::<u8>::with_capacity(canvas_dimensions.0 * canvas_dimensions.1 * 4);
 
-        //         // Time to get our image.
-        //         let buffer_slice = output_staging_buffer.slice(..);
-        //         let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
-        //         buffer_slice.map_async(wgpu::MapMode::Read, move |r| sender.send(r).unwrap());
+                // Time to get our image.
+                let buffer_slice = output_staging_buffer.slice(..);
+                let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+                buffer_slice.map_async(wgpu::MapMode::Read, move |r| sender.send(r).unwrap());
                 
-        //         device.poll(wgpu::Maintain::Wait);
-        //         receiver.receive().await.unwrap().unwrap();
-        //         // log::info!("Output buffer mapped.");
-        //         // {
-        //         //     let view = buffer_slice.get_mapped_range();
-        //         //     texture_data.extend_from_slice(&view[..]);
-        //         // }
-        //         // log::info!("Image data copied to local.");
+                device.poll(wgpu::Maintain::Wait);
+                receiver.receive().await.unwrap().unwrap();
+                log::info!("Output buffer mapped.");
+                {
+                    let view = buffer_slice.get_mapped_range();
+                    texture_data.extend_from_slice(&view[..]);
+                }
+                log::info!("Image data copied to local.");
     
-        //         // #[cfg(not(target_arch = "wasm32"))]
-        //         // let _path = _path.clone().unwrap().replace(".png", &format!("{}.png", i));
-        //         // output_image_native(texture_data.to_vec(), canvas_dimensions, _path);
-        //         // #[cfg(target_arch = "wasm32")]
-        //         // output_image_wasm(texture_data.to_vec(), canvas_dimensions);
-        //         // log::info!("Done.");
-        //     }
-        //     output_staging_buffer.unmap();
-        // }
+                #[cfg(not(target_arch = "wasm32"))]
+                let _path = _path.clone().unwrap().replace(".png", &format!("{}.png", i));
+                output_image_native(texture_data.to_vec(), canvas_dimensions, _path);
+                #[cfg(target_arch = "wasm32")]
+                output_image_wasm(texture_data.to_vec(), canvas_dimensions);
+                log::info!("Done.");
+            }
+            output_staging_buffer.unmap();
+        }
 
 
         let output_sums_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1509,7 +1495,7 @@ impl App{
         }
 
         queue.submit(Some(command_encoder.finish()));
-        
+
         let scores = {
             let sum_slice = output_sums_buffer.slice(..);
             let (sender2, reciever2) = futures_intrusive::channel::shared::oneshot_channel();

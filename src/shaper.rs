@@ -7,6 +7,7 @@ use rayon::prelude::*;
 struct Shape {
     pub x: i64,
     pub y: i64,
+    #[allow(dead_code)]
     pub rot: f64,
     pub fit: f64,
     image: DynamicImage,
