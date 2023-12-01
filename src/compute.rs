@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use wgpu::util::DeviceExt;
 
-use bytemuck;
+
 
 async fn run() {
     let instance = wgpu::Instance::default();
@@ -155,7 +155,7 @@ async fn run() {
     if let Some(Ok(())) = receiver.receive().await {
         let data_raw = &*buf_slice.get_mapped_range();
         let data: &[f32] = bytemuck::cast_slice(data_raw);
-        println!("data: {:?}", &*data);
+        println!("data: {:?}", data);
     }
 }
 

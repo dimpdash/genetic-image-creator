@@ -14,8 +14,8 @@ struct Shape {
 
 impl Shape {
     fn mutate(&mut self) {
-        self.x = self.x + 1;
-        self.y = self.y + 1;
+        self.x += 1;
+        self.y += 1;
     }
 
     fn get_image(&self) -> &DynamicImage {
@@ -57,14 +57,14 @@ impl Shaper {
 
 
 
-        let shape = Shape {
+        
+        Shape {
             x: rng.gen_range(0..self.target_image.width() as i64),
             y: rng.gen_range(0..self.target_image.height() as i64),
             rot: 0.0,
             image: image_resized,
             fit: 0.0,
-        };
-        shape
+        }
     }
 
     fn add_best_shape(&self, target_image: &DynamicImage, image: &mut DynamicImage) {

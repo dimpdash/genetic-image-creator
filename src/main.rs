@@ -1,32 +1,31 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::hash::Hasher;
-use std::mem::{MaybeUninit, self};
+
 use std::rc::Rc;
-use std::{num::NonZeroU32, future};
+use std::{num::NonZeroU32};
 use itertools::multiunzip; 
 
 //include arc
 use std::sync::Arc;
 
-#[cfg(not(target_arch = "wasm32"))]
-use genetic_image_creator::wgpu_utils::output_image_native;
-use opentelemetry::ExportError;
+
+
 use opentelemetry::global::{ObjectSafeSpan, BoxedSpan};
-use opentelemetry::trace::Span;
-use opentelemetry_sdk::trace::TracerProvider;
+
+
 use rand::Rng;
-use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator, IntoParallelIterator};
-use wgpu::{BindingResource, Texture};
+use rayon::iter::{ParallelIterator};
+
 use wgpu::{Features, Limits, BindGroup, Queue, Device, BindGroupLayout, util::DeviceExt, TextureView};
 #[cfg(target_arch = "wasm32")]
 use wgpu_example::utils::output_image_wasm;
-use opentelemetry::{global, trace::{TraceContextExt, Tracer, TracerProvider as _}, Context, ContextGuard };
-use cgmath;
-use cgmath::prelude::*;
-use opentelemetry_auto_span::auto_span;
+use opentelemetry::{global, trace::{TraceContextExt, Tracer}, Context, ContextGuard };
 
-use bytemuck;
+use cgmath::prelude::*;
+
+
+
 use itertools::{izip, Itertools};
 
 // include the repr C
@@ -170,7 +169,7 @@ impl TextureFactory {
         // if matching hash return texture removing it from the map
         if let Some(textures) = self.created_textures.get_mut(&hash) {
             if let Some(texture) = textures.pop() {
-                return texture;
+                texture
             } else {
                 // create texture and return it
                 Rc::new(device.create_texture(&texture_descriptor))
@@ -259,7 +258,7 @@ impl RenderPiplineFactory {
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("shader.wgsl"))),
         });
 
-        let (textures_bind_group, textures_bind_group_layout, texture_views) = RenderPiplineFactory::create_textures_bind_group(&device, &queue, images);
+        let (textures_bind_group, textures_bind_group_layout, _texture_views) = RenderPiplineFactory::create_textures_bind_group(device, queue, images);
 
         let render_pipeline_layout =
         device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -346,8 +345,8 @@ impl RenderPiplineFactory {
             let texture_descriptor = wgpu::TextureDescriptor {
                 label: None,
                 size: wgpu::Extent3d {
-                    width: width,
-                    height: height,
+                    width,
+                    height,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -506,7 +505,7 @@ impl<'a> RenderPipelineInstance<'a> {
         //overwrite data in the instance buffer
         let _instance_buffer_creation_guard = create_span_and_active_context("instance_buffer_update");
         let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
-        queue.write_buffer(&factory.instance_buffer, 0, &bytemuck::cast_slice(&instance_data));
+        queue.write_buffer(&factory.instance_buffer, 0, bytemuck::cast_slice(&instance_data));
 
         drop(_instance_buffer_creation_guard);
 
@@ -531,9 +530,9 @@ impl<'a> RenderPipelineInstance<'a> {
         drop(_render_pipleline_instance_creation_guard);
  
         RenderPipelineInstance {
-            factory: &factory,
-            instances: instances,
-            render_target: render_target,
+            factory,
+            instances,
+            render_target,
             output_buffer: None,
         }
     }
@@ -664,7 +663,7 @@ impl TextureSubtractPipelineFactory {
 
         TextureSubtractPipelineFactory {
             compute_pipeline: pipeline,
-            bind_group_layout: bind_group_layout,
+            bind_group_layout,
             texture_factory
         }
     }
@@ -674,8 +673,8 @@ impl TextureSubtractPipelineFactory {
             let texture_descriptor = wgpu::TextureDescriptor {
                 label: None,
                 size: wgpu::Extent3d {
-                    width: width,
-                    height: height,
+                    width,
+                    height,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -706,7 +705,7 @@ struct TextureSubtractPipeline<'a> {
 impl<'a> TextureSubtractPipeline<'a> {
     pub fn new(graphics_processor: &GraphicsProcessor, a_texture: &'a wgpu::Texture, b_texture: &'a wgpu::Texture, factory: &'a TextureSubtractPipelineFactory) -> TextureSubtractPipeline<'a> {
         let device = &graphics_processor.device;
-        let queue = &graphics_processor.queue;
+        let _queue = &graphics_processor.queue;
 
         let _guard_output_texture_creation = create_span_and_active_context("output_texture_creation");
         let output_texture = factory.texture_factory.borrow_mut().create_texture(wgpu::TextureDescriptor {
@@ -730,7 +729,7 @@ impl<'a> TextureSubtractPipeline<'a> {
         let _guard_bind_group_creation = create_span_and_active_context("bind_group_creation");
         let bind_group = device.create_bind_group(
             &wgpu::BindGroupDescriptor {
-                layout: &bind_group_layout,
+                layout: bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -752,8 +751,8 @@ impl<'a> TextureSubtractPipeline<'a> {
 
         TextureSubtractPipeline {
             compute_pipeline: &factory.compute_pipeline,
-            a_texture: a_texture,
-            b_texture: b_texture,
+            a_texture,
+            b_texture,
             output_texture,
             bind_group,
         }
@@ -761,7 +760,7 @@ impl<'a> TextureSubtractPipeline<'a> {
 
     pub fn add_to_encoder(&self, command_encoder: &mut wgpu::CommandEncoder) {
         let mut cpass = command_encoder.begin_compute_pass(&Default::default());
-        cpass.set_pipeline(&self.compute_pipeline);
+        cpass.set_pipeline(self.compute_pipeline);
         cpass.set_bind_group(0, &self.bind_group, &[]);
         cpass.dispatch_workgroups(self.a_texture.width(), self.b_texture.height(), 1);
     }
@@ -826,7 +825,7 @@ struct SumTextureArrayPipeline {
 impl SumTextureArrayPipeline {
     pub fn new(graphicsProcessor: &GraphicsProcessor, texture_views: Vec<wgpu::TextureView>) -> SumTextureArrayPipeline {
         let device = &graphicsProcessor.device;
-        let queue = &graphicsProcessor.queue;
+        let _queue = &graphicsProcessor.queue;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
@@ -936,7 +935,7 @@ struct SumTexturePipeline<'a> {
 impl<'a> SumTexturePipeline<'a> {
     pub fn new(graphicsProcessor: &GraphicsProcessor, input_texture: &'a wgpu::Texture) -> SumTexturePipeline<'a> {
         let device = &graphicsProcessor.device;
-        let queue = &graphicsProcessor.queue;
+        let _queue = &graphicsProcessor.queue;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
@@ -1086,8 +1085,8 @@ impl GraphicsProcessorBuilder{
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: None,
-                    features: features,
-                    limits: limits,
+                    features,
+                    limits,
                 },
                 None,
             )
@@ -1128,11 +1127,11 @@ struct Graphic2D {
 impl Graphic2D{
     fn new(x: f32, y: f32, rot: f32, image: Arc<ImageWrapper>, scale : f32) -> Graphic2D {
         Graphic2D {
-            x: x,
-            y: y,
-            rot: rot,
-            image: image,
-            scale: scale,
+            x,
+            y,
+            rot,
+            image,
+            scale,
         }
     }
 
@@ -1235,9 +1234,9 @@ impl EvolutionEnvironment {
         EvolutionEnvironment {
             unranked_shapes: vec![],
             ranked_shapes: vec![],
-            shape_pool_size: shape_pool_size,
+            shape_pool_size,
             shaper,
-            duplication_factor: duplication_factor,
+            duplication_factor,
 
         }
     }
@@ -1245,8 +1244,8 @@ impl EvolutionEnvironment {
     pub fn setup_pool(&mut self) {
         //randomly generate shapes
         self.unranked_shapes = (0..self.shape_pool_size).map(|_| {
-            let shape = self.shaper.get_random_shape();
-            (shape)
+            
+            self.shaper.get_random_shape()
         }).collect::<Vec<_>>();
     }
 
@@ -1349,7 +1348,7 @@ impl App{
             let path = entry.path();
             let image = image::open(path).unwrap();
             images.push(Arc::new(ImageWrapper {
-                image: image,
+                image,
                 texture_id: texture_id as u32 + upto,
             }));
         }
@@ -1396,9 +1395,9 @@ impl App{
         let expected_concurrent_instances = next_shapes.len() as u32;
         let device = &self.graphics_processor.device;
         let queue = &self.graphics_processor.queue;
-        let mut render_pipeline_factory = &self.gpu_cache.render_pipeline_factory;
+        let render_pipeline_factory = &self.gpu_cache.render_pipeline_factory;
         render_pipeline_factory.load_texture_factory(&self.graphics_processor, expected_concurrent_instances, width, height);
-        let mut texture_subtract_pipeline_factory = &self.gpu_cache.texture_subtract_pipeline_factory;
+        let texture_subtract_pipeline_factory = &self.gpu_cache.texture_subtract_pipeline_factory;
         texture_subtract_pipeline_factory.load_texture_factory(&self.graphics_processor, expected_concurrent_instances, width, height);
         let target_image = &self.gpu_cache.target_texture;
 
@@ -1413,10 +1412,10 @@ impl App{
 
         let _guard = create_span_and_active_context("create command buffers");
 
-        let (command_buffers, output_texture_views, render_pipelines) : (Vec<_>, Vec<_>, Vec<_>)  = multiunzip(izip!(next_shapes.iter())
+        let (command_buffers, output_texture_views, _render_pipelines) : (Vec<_>, Vec<_>, Vec<_>)  = multiunzip(izip!(next_shapes.iter())
             // .collect::<Vec<_>>()
             // .par_iter()
-            .map(|(new_shape)| {
+            .map(|new_shape| {
 
 
                 let command_buffer_guard = create_span_and_active_context("create command buffer");
@@ -1428,7 +1427,7 @@ impl App{
                 instances.push(new_shape.create_instance().fix_scale(self.get_canvas_dimensions()));
 
                 let render_pipeline_guard = create_span_and_active_context("render_pipeline");
-                let mut renderPipeline = RenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), instances, render_pipeline_factory);
+                let renderPipeline = RenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), instances, render_pipeline_factory);
                 //Uncomment to get the render target
                 // renderPipeline.set_output_buffer(&output_staging_buffer);
 
@@ -1505,7 +1504,7 @@ impl App{
         let mut command_encoder =
             self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
-            let mut sumPipeline = SumTextureArrayPipeline::new(&self.graphics_processor, output_texture_views);
+            let sumPipeline = SumTextureArrayPipeline::new(&self.graphics_processor, output_texture_views);
             sumPipeline.add_to_encoder(&mut command_encoder);
             sumPipeline.copy_output_to_buffer(&mut command_encoder, &output_sums_buffer);
         }
@@ -1526,7 +1525,7 @@ impl App{
         }
         output_sums_buffer.unmap();
 
-        return scores;
+        scores
     }
 
     fn create_target_texture(image: &DynamicImage, device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Texture {
@@ -1654,14 +1653,14 @@ T: Into<Cow<'static, str>>,
     global::tracer("").start(name)
 }
 
-fn create_span_and_active_context<T>(name: T) -> (ContextGuard)
+fn create_span_and_active_context<T>(name: T) -> ContextGuard
 where
 T: Into<Cow<'static, str>>,
 {
     let span = create_span(name);
     let cx = Context::current_with_span(span);
-    let guard = Context::attach(cx);
-    (guard)
+    
+    Context::attach(cx)
 }
 
 fn end_span(mut span: BoxedSpan) {
@@ -1670,7 +1669,7 @@ fn end_span(mut span: BoxedSpan) {
 
 async fn run_logger(path : Option<String>) {
     global::set_text_map_propagator(opentelemetry_jaeger::Propagator::new());
-    let tracer = opentelemetry_jaeger::new_agent_pipeline().with_service_name("genetic-image-creator").install_simple().unwrap();
+    let _tracer = opentelemetry_jaeger::new_agent_pipeline().with_service_name("genetic-image-creator").install_simple().unwrap();
 
     run(path).await;
 

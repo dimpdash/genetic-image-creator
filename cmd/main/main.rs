@@ -20,8 +20,8 @@ fn main() {
         keep: 10,
         rounds: 3,
         replication_factor: 4,
-        source_images: source_images,
-        target_image: target_image,
+        source_images,
+        target_image,
     };
 
     let image = shaper.generate_image();
