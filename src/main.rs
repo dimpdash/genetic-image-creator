@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use std::hash::Hasher;
 
 use std::rc::Rc;
-use std::{num::NonZeroU32};
+use std::num::NonZeroU32;
 use itertools::multiunzip; 
 
 //include arc
@@ -11,11 +11,10 @@ use std::sync::Arc;
 
 
 
-use opentelemetry::global::{ObjectSafeSpan, BoxedSpan};
+use opentelemetry::global::BoxedSpan;
 
 
 use rand::Rng;
-use rayon::iter::{ParallelIterator};
 
 use wgpu::{Features, Limits, BindGroup, Queue, Device, BindGroupLayout, util::DeviceExt, TextureView};
 #[cfg(target_arch = "wasm32")]
@@ -26,7 +25,7 @@ use cgmath::prelude::*;
 
 
 
-use itertools::{izip, Itertools};
+use itertools::izip;
 
 // include the repr C
 
@@ -54,7 +53,7 @@ impl Vertex {
 }
 
 #[derive(Copy, Clone, Debug)]
-struct Instance {
+pub struct Instance {
     position: cgmath::Vector3<f32>,
     rotation: cgmath::Quaternion<f32>,
     scale: cgmath::Vector3<f32>,
@@ -147,7 +146,7 @@ const INDICES: &[u16] = &[
     0, 1, 3, // second triangle
 ];
 
-struct TextureFactory {
+pub struct TextureFactory {
     created_textures : std::collections::HashMap<u64, Vec<Rc<wgpu::Texture>>>,
 }
 
@@ -205,10 +204,15 @@ impl TextureFactory {
 }
 
 
-struct RenderPiplineFactory {
+pub struct RenderPiplineFactory {
+    //ownership
+    #[allow(dead_code)]
     pipeline: wgpu::RenderPipeline,
+    #[allow(dead_code)]
     vertex_buffer: wgpu::Buffer,
+    #[allow(dead_code)]
     index_buffer: wgpu::Buffer,
+    #[allow(dead_code)]
     textures_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
     texture_factory: Rc<RefCell<TextureFactory>>,
@@ -488,9 +492,8 @@ impl RenderPiplineFactory {
     }
 }
 
-struct RenderPipelineInstance<'a> {
+pub struct RenderPipelineInstance<'a> {
     factory: &'a RenderPiplineFactory,
-    instances: Vec<Instance>,
     render_target: Rc<wgpu::Texture>,
     output_buffer: Option<&'a wgpu::Buffer>
 }
@@ -531,13 +534,12 @@ impl<'a> RenderPipelineInstance<'a> {
  
         RenderPipelineInstance {
             factory,
-            instances,
             render_target,
             output_buffer: None,
         }
     }
 
-    fn set_output_buffer(&mut self, output_buffer: &'a wgpu::Buffer) {
+    pub fn set_output_buffer(&mut self, output_buffer: &'a wgpu::Buffer) {
         self.output_buffer = Some(output_buffer);
     }
 
@@ -593,9 +595,7 @@ impl<'a> RenderPipelineInstance<'a> {
 
 }
 
-type OwnedBuf<'a> = Option<(&'a wgpu::Buffer, Option<wgpu::Buffer>)>;
-
-struct TextureSubtractPipelineFactory {
+pub struct TextureSubtractPipelineFactory {
     compute_pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     texture_factory: Rc<RefCell<TextureFactory>>,
@@ -694,7 +694,7 @@ impl TextureSubtractPipelineFactory {
 
 }
 
-struct TextureSubtractPipeline<'a> {
+pub struct TextureSubtractPipeline<'a> {
     compute_pipeline: &'a wgpu::ComputePipeline,
     a_texture: &'a wgpu::Texture,
     b_texture: &'a wgpu::Texture,
@@ -793,7 +793,7 @@ impl<'a> TextureSubtractPipeline<'a> {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct ImageSizeContents {
+pub struct ImageSizeContents {
     pub width: u32,
     pub height: u32,
 }
@@ -803,7 +803,7 @@ impl ImageSizeContents {
     const ATTRIBS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32];
 
-    fn desc() -> wgpu::VertexBufferLayout<'static> {
+    pub fn desc() -> wgpu::VertexBufferLayout<'static> {
         use std::mem;
 
         wgpu::VertexBufferLayout {
@@ -823,9 +823,9 @@ struct SumTextureArrayPipeline {
 }
 
 impl SumTextureArrayPipeline {
-    pub fn new(graphicsProcessor: &GraphicsProcessor, texture_views: Vec<wgpu::TextureView>) -> SumTextureArrayPipeline {
-        let device = &graphicsProcessor.device;
-        let _queue = &graphicsProcessor.queue;
+    pub fn new(graphics_processor: &GraphicsProcessor, texture_views: Vec<wgpu::TextureView>) -> SumTextureArrayPipeline {
+        let device = &graphics_processor.device;
+        let _queue = &graphics_processor.queue;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
@@ -925,17 +925,18 @@ impl SumTextureArrayPipeline {
     }
 }
 
-struct SumTexturePipeline<'a> {
+pub struct SumTexturePipeline<'a> {
     compute_pipeline: wgpu::ComputePipeline,
+    #[allow(dead_code)]
     input_texture: &'a wgpu::Texture,
     output_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
 
 impl<'a> SumTexturePipeline<'a> {
-    pub fn new(graphicsProcessor: &GraphicsProcessor, input_texture: &'a wgpu::Texture) -> SumTexturePipeline<'a> {
-        let device = &graphicsProcessor.device;
-        let _queue = &graphicsProcessor.queue;
+    pub fn new(graphics_processor: &GraphicsProcessor, input_texture: &'a wgpu::Texture) -> SumTexturePipeline<'a> {
+        let device = &graphics_processor.device;
+        let _queue = &graphics_processor.queue;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
@@ -1101,7 +1102,7 @@ impl GraphicsProcessorBuilder{
     }
 }
 
-struct GraphicsProcessor {
+pub struct GraphicsProcessor {
     device: wgpu::Device,
     queue: wgpu::Queue,
 }
@@ -1116,7 +1117,7 @@ struct ImageWrapper {
 }
 
 #[derive(Clone)]
-struct Graphic2D {
+pub struct Graphic2D {
     x: f32,
     y: f32,
     scale: f32,
@@ -1135,7 +1136,7 @@ impl Graphic2D{
         }
     }
 
-    pub fn get_image(&self) -> Arc::<ImageWrapper> {
+    fn get_image(&self) -> Arc::<ImageWrapper> {
         self.image.clone()
     } 
 
@@ -1160,7 +1161,7 @@ impl Graphic2D{
 
     }
 
-    fn get_width(&self) -> u32 {
+    pub fn get_width(&self) -> u32 {
         (self.image.image.width() as f32 * self.scale) as u32
     }
 
@@ -1427,25 +1428,25 @@ impl App{
                 instances.push(new_shape.create_instance().fix_scale(self.get_canvas_dimensions()));
 
                 let render_pipeline_guard = create_span_and_active_context("render_pipeline");
-                let renderPipeline = RenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), instances, render_pipeline_factory);
+                let render_pipeline = RenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), instances, render_pipeline_factory);
                 //Uncomment to get the render target
                 // renderPipeline.set_output_buffer(&output_staging_buffer);
 
                 let mut command_encoder = self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-                renderPipeline.add_to_encoder(&mut command_encoder);
+                render_pipeline.add_to_encoder(&mut command_encoder);
 
                 drop(render_pipeline_guard);
 
                 // subtract from target image
-                let rendered_image = renderPipeline.get_render_target();
+                let rendered_image = render_pipeline.get_render_target();
 
                 let subtract_pipeline_guard = create_span_and_active_context("subtract_pipeline");
                 //create storage texture to store difference in 
-                let subtractPipeline = TextureSubtractPipeline::new(&self.graphics_processor, target_image, rendered_image, texture_subtract_pipeline_factory);
-                subtractPipeline.add_to_encoder(&mut command_encoder);
+                let subtract_pipeline = TextureSubtractPipeline::new(&self.graphics_processor, target_image, rendered_image, texture_subtract_pipeline_factory);
+                subtract_pipeline.add_to_encoder(&mut command_encoder);
                 // subtractPipeline.copy_output_to_buffer(&mut command_encoder, output_staging_buffer);
-                let output_texture = subtractPipeline.output_texture;
+                let output_texture = subtract_pipeline.output_texture;
 
                 let output_texture_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -1453,7 +1454,7 @@ impl App{
 
                 drop(command_buffer_guard);
 
-                (command_encoder.finish(), output_texture_view, renderPipeline)
+                (command_encoder.finish(), output_texture_view, render_pipeline)
             }));
         drop(_guard);
         {
@@ -1492,8 +1493,6 @@ impl App{
         // }
 
 
-        let mut scores = vec![];
-
         let output_sums_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Output Sum Buffer"),
             size: (next_shapes.len() * std::mem::size_of::<f32>()) as u64,
@@ -1504,25 +1503,25 @@ impl App{
         let mut command_encoder =
             self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
-            let sumPipeline = SumTextureArrayPipeline::new(&self.graphics_processor, output_texture_views);
-            sumPipeline.add_to_encoder(&mut command_encoder);
-            sumPipeline.copy_output_to_buffer(&mut command_encoder, &output_sums_buffer);
+            let sum_pipeline = SumTextureArrayPipeline::new(&self.graphics_processor, output_texture_views);
+            sum_pipeline.add_to_encoder(&mut command_encoder);
+            sum_pipeline.copy_output_to_buffer(&mut command_encoder, &output_sums_buffer);
         }
 
         queue.submit(Some(command_encoder.finish()));
-        {
+        
+        let scores = {
             let sum_slice = output_sums_buffer.slice(..);
             let (sender2, reciever2) = futures_intrusive::channel::shared::oneshot_channel();
             sum_slice.map_async(wgpu::MapMode::Read, move |r| sender2.send(r).unwrap());
             
             device.poll(wgpu::Maintain::Wait);
             reciever2.receive().await.unwrap().unwrap();
-            {
-                let view = sum_slice.get_mapped_range();
-                let sum: &[f32] = bytemuck::cast_slice(&view);
-                scores = sum.into();
-            }
-        }
+            let view = sum_slice.get_mapped_range();
+            let sum: &[f32] = bytemuck::cast_slice(&view);
+            
+            sum.into()
+        };
         output_sums_buffer.unmap();
 
         scores
@@ -1661,10 +1660,6 @@ T: Into<Cow<'static, str>>,
     let cx = Context::current_with_span(span);
     
     Context::attach(cx)
-}
-
-fn end_span(mut span: BoxedSpan) {
-    ObjectSafeSpan::end(&mut span)
 }
 
 async fn run_logger(path : Option<String>) {
