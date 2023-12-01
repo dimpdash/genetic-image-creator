@@ -211,11 +211,13 @@ struct RenderPiplineFactory {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     textures_bind_group: wgpu::BindGroup,
+    instance_buffer: wgpu::Buffer,
     texture_factory: Rc<RefCell<TextureFactory>>,
+    render_bundle: wgpu::RenderBundle,
 }
 
 impl RenderPiplineFactory {
-    pub fn new(graphics_processor: &GraphicsProcessor, images: &Vec<DynamicImage>, texture_factory : Rc<RefCell<TextureFactory>>) -> RenderPiplineFactory {
+    pub fn new(graphics_processor: &GraphicsProcessor, images: &Vec<DynamicImage>, texture_factory : Rc<RefCell<TextureFactory>>, max_instances : u64) -> RenderPiplineFactory {
         let device = &graphics_processor.device;
         let queue = &graphics_processor.queue;
 
@@ -233,6 +235,24 @@ impl RenderPiplineFactory {
                 usage: wgpu::BufferUsages::INDEX,
             }
         );
+
+        // create place holder instances
+        let instances = (0..max_instances)
+            .map(|_| Instance {
+                // creating an instance at (0.0, 0.0) makes it not be rendered
+                position: cgmath::Vector3::new(0.0, 0.0, 0.0),
+                rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0)),
+                scale: cgmath::Vector3::new(1.0, 1.0, 1.0),
+                texture_index: 0,
+                post_scale: cgmath::Vector3::new(1.0, 1.0, 1.0),})
+            .map(|instance| instance.to_raw())
+            .collect::<Vec<_>>();
+
+        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Instance Buffer"),
+            contents: bytemuck::cast_slice(&instances),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
@@ -285,12 +305,39 @@ impl RenderPiplineFactory {
         });
 
 
+        // create the render bundle
+        let mut render_bundle_encoder = device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
+            label: Some("render_bundle_encoder"),
+            color_formats: &[Some(wgpu::TextureFormat::Rgba8Unorm)],
+            sample_count: 1,
+            depth_stencil: None,
+            multiview: None,
+        });
+
+        render_bundle_encoder.set_pipeline(&pipeline);
+        //add texture
+        render_bundle_encoder.set_bind_group(0, &textures_bind_group, &[]);
+        //add vertrices
+        render_bundle_encoder.set_vertex_buffer(0, vertex_buffer.slice(..));
+        render_bundle_encoder.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+        // set the instances
+        render_bundle_encoder.set_vertex_buffer(0, instance_buffer.slice(..));
+        // draw call
+        render_bundle_encoder.draw_indexed(0..INDICES.len() as u32, 0, 0..max_instances as u32);
+
+
+        let render_bundle = render_bundle_encoder.finish(&wgpu::RenderBundleDescriptor {
+            label: Some("render_bundle"),
+        });
+
         RenderPiplineFactory {
             pipeline,
             vertex_buffer,
             index_buffer,
             textures_bind_group,
+            instance_buffer,
             texture_factory,
+            render_bundle,    
         }
     }
 
@@ -445,7 +492,6 @@ impl RenderPiplineFactory {
 struct RenderPipelineInstance<'a> {
     factory: &'a RenderPiplineFactory,
     instances: Vec<Instance>,
-    instance_buffer: wgpu::Buffer,
     render_target: Rc<wgpu::Texture>,
     output_buffer: Option<&'a wgpu::Buffer>
 }
@@ -455,16 +501,13 @@ impl<'a> RenderPipelineInstance<'a> {
     pub fn new(graphics_processor: &GraphicsProcessor, canvas_dimensions : (usize, usize), instances: Vec<Instance>, factory: &'a RenderPiplineFactory) -> RenderPipelineInstance<'a> {
         let _render_pipleline_instance_creation_guard = create_span_and_active_context("render_pipeline_instance_creation");
         let device = &graphics_processor.device;
-        // create an empty instance buffer
-        let _instance_buffer_creation_guard = create_span_and_active_context("instance_buffer_creation");
+        let queue = &graphics_processor.queue;
+
+        //overwrite data in the instance buffer
+        let _instance_buffer_creation_guard = create_span_and_active_context("instance_buffer_update");
         let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
-        let instance_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Instance Buffer"),
-                contents: &bytemuck::cast_slice(&instance_data),
-                usage: wgpu::BufferUsages::VERTEX,
-            }
-        );
+        queue.write_buffer(&factory.instance_buffer, 0, &bytemuck::cast_slice(&instance_data));
+
         drop(_instance_buffer_creation_guard);
 
 
@@ -490,7 +533,6 @@ impl<'a> RenderPipelineInstance<'a> {
         RenderPipelineInstance {
             factory: &factory,
             instances: instances,
-            instance_buffer: instance_buffer,
             render_target: render_target,
             output_buffer: None,
         }
@@ -509,7 +551,7 @@ impl<'a> RenderPipelineInstance<'a> {
 
         {
             let _guard = create_span_and_active_context("render_pass");
-            let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &render_texture_view,
@@ -522,18 +564,7 @@ impl<'a> RenderPipelineInstance<'a> {
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
                 timestamp_writes: None,
-            });
-            render_pass.set_pipeline(&self.factory.pipeline);
-            //add texture
-            render_pass.set_bind_group(0, &self.factory.textures_bind_group, &[]);
-            //add vertrices
-            render_pass.set_vertex_buffer(0, self.factory.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.factory.index_buffer.slice(..), wgpu::IndexFormat::Uint16); 
-            // set the instances
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-            render_pass.set_index_buffer(self.factory.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-
-            render_pass.draw_indexed(0..INDICES.len() as u32, 0, 0..self.instances.len() as u32);
+            }).execute_bundles([&self.factory.render_bundle]);
         }
 
         if let Some(output_buffer) = self.output_buffer {
@@ -1280,7 +1311,7 @@ impl App{
         let texture_factory = Rc::new(RefCell::new(TextureFactory::new()));
 
         let gpu_cache = GpuCached {
-            render_pipeline_factory: RenderPiplineFactory::new(&graphics_processor, &image_textures, texture_factory.clone()),
+            render_pipeline_factory: RenderPiplineFactory::new(&graphics_processor, &image_textures, texture_factory.clone(), number_of_shapes as u64),
             texture_subtract_pipeline_factory: TextureSubtractPipelineFactory::new(&graphics_processor, texture_factory),
             target_texture: App::create_target_texture(&target_image_texture, &graphics_processor.device, queue),
         };
