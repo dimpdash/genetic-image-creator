@@ -4,7 +4,7 @@ use std::hash::Hasher;
 
 use std::rc::Rc;
 use std::num::NonZeroU32;
-use genetic_image_creator::wgpu_utils::output_image_native;
+use genetic_image_creator::{wgpu_utils::output_image_native, shaper};
 use itertools::multiunzip; 
 
 //include arc
@@ -451,7 +451,7 @@ pub struct RenderPipelineInstance<'a> {
 
 impl<'a> RenderPipelineInstance<'a> {
 
-    pub fn new(graphics_processor: &GraphicsProcessor, canvas_dimensions : (usize, usize), instances: Vec<Instance>, factory: &'a RenderPiplineFactory) -> RenderPipelineInstance<'a> {
+    pub fn new(graphics_processor: &GraphicsProcessor, canvas_dimensions : (usize, usize), instances: Vec<Instance>, factory: &RenderPiplineFactory) -> RenderPipelineInstance<'a> {
         let _render_pipleline_instance_creation_guard = create_span_and_active_context("render_pipeline_instance_creation");
         let device = &graphics_processor.device;
 
@@ -1295,11 +1295,27 @@ impl App{
         let queue = &graphics_processor.queue;
 
         let texture_factory = Rc::new(RefCell::new(TextureFactory::new()));
+        let render_pipeline_factory = RenderPiplineFactory::new(&graphics_processor, &image_textures, texture_factory.clone());
+        let mut render_pipelines = vec![];
+        
+        for i in (0..evolution_environment.shape_pool_size) {
+            render_pipelines.push(
+                RenderPipelineInstance::new(
+                    &graphics_processor, 
+                    (target_image_texture.width() as usize, target_image_texture.height() as usize), 
+                    //create instances
+                    // instances at (0,0) are not displayed
+                    (0..2*number_of_shapes).map(|_| Graphic2D::new(0.0, 0.0, 0.0, images[0].clone(), 1.0).create_instance()).collect::<Vec<_>>(),
+                    &render_pipeline_factory
+                )
+            );
+        }
 
         let gpu_cache = GpuCached {
-            render_pipeline_factory: RenderPiplineFactory::new(&graphics_processor, &image_textures, texture_factory.clone()),
-            texture_subtract_pipeline_factory: TextureSubtractPipelineFactory::new(&graphics_processor, texture_factory),
+            render_pipeline_factory,
+            texture_subtract_pipeline_factory: TextureSubtractPipelineFactory::new(&graphics_processor, texture_factory.clone()) ,
             target_texture: App::create_target_texture(&target_image_texture, &graphics_processor.device, queue),
+            render_pipelines,
         };
 
         App {
@@ -1310,7 +1326,7 @@ impl App{
             number_of_shapes,
             evolution_environment,
             rounds,
-            gpu_cache
+            gpu_cache,
         }
     }
 
@@ -1378,8 +1394,7 @@ impl App{
         let canvas_dimensions = self.get_canvas_dimensions();
         let width = canvas_dimensions.0 as u32;
         let height = canvas_dimensions.1 as u32;
-        let next_shapes = self.evolution_environment.get_unranked_shapes();
-        let expected_concurrent_instances = next_shapes.len() as u32;
+        let expected_concurrent_instances = self.evolution_environment.get_unranked_shapes().len() as u32;
         let device = &self.graphics_processor.device;
         let queue = &self.graphics_processor.queue;
         let render_pipeline_factory = &self.gpu_cache.render_pipeline_factory;
@@ -1389,7 +1404,23 @@ impl App{
         let target_image = &self.gpu_cache.target_texture;
 
 
-        let output_staging_buffers = next_shapes.iter().map(|_| {
+        let _guard = create_span_and_active_context("create command buffers");
+
+
+        let instances_set = self.evolution_environment.get_unranked_shapes().iter().map(|new_shape| {
+            let mut instances = vec![];
+            //add shapess
+            instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
+            //add new shape
+            instances.push(new_shape.create_instance().fix_scale(self.get_canvas_dimensions()));
+
+            instances
+        }).collect::<Vec<_>>();
+
+        let render_pipelines = &mut self.gpu_cache.render_pipelines;
+
+        
+        let output_staging_buffers = self.evolution_environment.get_unranked_shapes().iter().map(|_| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: (Some("Output Staging Buffer")),
                 size: (std::mem::size_of::<f32>() * canvas_dimensions.0 * canvas_dimensions.1) as u64,
@@ -1397,29 +1428,19 @@ impl App{
                 mapped_at_creation: false,
             })}).collect::<Vec<_>>();
 
-        let _guard = create_span_and_active_context("create command buffers");
-
-        let (command_buffers, output_texture_views, _render_pipelines) : (Vec<_>, Vec<_>, Vec<_>)  = multiunzip(izip!(next_shapes.iter(), output_staging_buffers.iter())
+        let (command_buffers, output_texture_views) : (Vec<_>, Vec<_>)  = multiunzip(izip!(instances_set, render_pipelines.iter_mut())
             // .collect::<Vec<_>>()
             // .par_iter()
-            .map(|(new_shape, output_staging_buffer)| {
-
-
+            .map(|(instances, render_pipeline)| {
                 let command_buffer_guard = create_span_and_active_context("create command buffer");
 
-                let mut instances = vec![];
-                //add shapess
-                instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
-                //add new shape
-                instances.push(new_shape.create_instance().fix_scale(self.get_canvas_dimensions()));
-
                 let render_pipeline_guard = create_span_and_active_context("render_pipeline");
-                let mut render_pipeline = RenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), instances, render_pipeline_factory);
+                render_pipeline.set_instances(queue, &instances);
                 //Uncomment to get the render target
-                render_pipeline.set_output_buffer(&output_staging_buffer);
+                // render_pipeline.set_output_buffer(&output_staging_buffer);
 
                 let mut command_encoder = self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-
+                
                 render_pipeline.add_to_encoder(&mut command_encoder);
 
                 drop(render_pipeline_guard);
@@ -1440,7 +1461,7 @@ impl App{
 
                 drop(command_buffer_guard);
 
-                (command_encoder.finish(), output_texture_view, render_pipeline)
+                (command_encoder.finish(), output_texture_view)
             }));
         drop(_guard);
         {
@@ -1481,7 +1502,7 @@ impl App{
 
         let output_sums_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Output Sum Buffer"),
-            size: (next_shapes.len() * std::mem::size_of::<f32>()) as u64,
+            size: (self.evolution_environment.get_unranked_shapes().len() * std::mem::size_of::<f32>()) as u64,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1576,6 +1597,7 @@ struct GpuCached {
     render_pipeline_factory: RenderPiplineFactory,
     texture_subtract_pipeline_factory: TextureSubtractPipelineFactory,
     target_texture : wgpu::Texture,
+    render_pipelines: Vec<RenderPipelineInstance<'static>>,
 }
 
 async fn run(_path: Option<String>) {
