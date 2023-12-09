@@ -449,26 +449,33 @@ struct RenderPipelineInstance<'a> {
     render_bundle: wgpu::RenderBundle,
 }
 
+enum InstanceSetup {
+    MaxInstances(usize),
+    Instances(Vec<Instance>),
+}
+
 impl<'a> RenderPipelineInstance<'a> {
 
-    pub fn new(graphics_processor: &GraphicsProcessor, canvas_dimensions : (usize, usize), instances: Vec<Instance>, factory: &RenderPiplineFactory) -> RenderPipelineInstance<'a> {
+    pub fn new(graphics_processor: &GraphicsProcessor, canvas_dimensions : (usize, usize), instance_setup: InstanceSetup, factory: &RenderPiplineFactory) -> RenderPipelineInstance<'a> {
         let _render_pipleline_instance_creation_guard = create_span_and_active_context("render_pipeline_instance_creation");
         let device = &graphics_processor.device;
         // create an empty instance buffer
         let _instance_buffer_creation_guard = create_span_and_active_context("instance_buffer_creation");
-        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
 
-        // create place holder instances
-        let instances = (0..instances.len())
-            .map(|_| Instance {
-                // creating an instance at (0.0, 0.0) makes it not be rendered
-                position: cgmath::Vector3::new(0.0, 0.0, 0.0),
-                rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0)),
-                scale: cgmath::Vector3::new(1.0, 1.0, 1.0),
-                texture_index: 0,
-                post_scale: cgmath::Vector3::new(1.0, 1.0, 1.0),})
-            .map(|instance| instance.to_raw())
-            .collect::<Vec<_>>();
+        let instances = match instance_setup {
+            InstanceSetup::MaxInstances(max_instances) => {
+                (0..max_instances)
+                    .map(|_| Instance {
+                        // creating an instance at (0.0, 0.0) makes it not be rendered
+                        position: cgmath::Vector3::new(0.0, 0.0, 0.0),
+                        rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0)),
+                        scale: cgmath::Vector3::new(0.0, 0.0, 0.0),
+                        texture_index: 0,
+                        post_scale: cgmath::Vector3::new(1.0, 1.0, 1.0),})
+                    .collect::<Vec<_>>()
+            },
+            InstanceSetup::Instances(instances) => instances,
+        }.iter().map(|instance| instance.to_raw()).collect::<Vec<_>>();
 
         let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Instance Buffer"),
@@ -1314,7 +1321,7 @@ impl App{
         let canvas_dimensions = (target_image_texture.width() as usize, target_image_texture.height() as usize);
 
         let render_pipeline_instances = (0..number_of_shapes).map(|_| {
-            RenderPipelineInstance::new(&graphics_processor, canvas_dimensions, vec![], &RenderPiplineFactory::new(&graphics_processor, &image_textures, texture_factory.clone()))
+            RenderPipelineInstance::new(&graphics_processor, canvas_dimensions, InstanceSetup::MaxInstances(0), &RenderPiplineFactory::new(&graphics_processor, &image_textures, texture_factory.clone()))
         }).collect::<Vec<_>>();
 
         let gpu_cache = GpuCached {
@@ -1436,13 +1443,14 @@ impl App{
                 instances.push(new_shape.create_instance().fix_scale(self.get_canvas_dimensions()));
 
                 let render_pipeline_guard = create_span_and_active_context("render_pipeline");
-                let mut renderPipeline = RenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), instances.clone(), render_pipeline_factory);
+                let mut renderPipeline = RenderPipelineInstance::new(&self.graphics_processor, self.get_canvas_dimensions(), InstanceSetup::MaxInstances(instances.len()), render_pipeline_factory);
                 //Uncomment to get the render target
                 renderPipeline.set_output_buffer(&output_staging_buffer);
 
                 let mut command_encoder = self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
                 renderPipeline.set_instances(queue, &instances);
+                
                 renderPipeline.add_to_encoder(device, &mut command_encoder);
 
                 drop(render_pipeline_guard);
