@@ -1408,10 +1408,22 @@ impl App{
 
             for round in 0..self.rounds {
                 println!("Round: {}", round);
+                let _guard_tmp = create_span_and_active_context("run_round");
                 let scores = self.run_round(_path.clone()).await;
+                drop(_guard_tmp);
+
+                let _guard_tmp = create_span_and_active_context("rank_shapes");
                 self.evolution_environment.rank_shapes(&scores);
+                drop(_guard_tmp);
+                
+                let _guard_tmp = create_span_and_active_context("cull_bad_shapes");
                 self.evolution_environment.cull_bad_shapes();
+                drop(_guard_tmp);
+
+                let _guard_tmp = create_span_and_active_context("mutate_shapes_into_unranked_pool");
                 self.evolution_environment.mutate_shapes_into_unranked_pool();
+                drop(_guard_tmp);
+                
             }
             // select best shape
             let best_shape = self.best_shape();
@@ -1526,6 +1538,7 @@ impl App{
 
         let mut scores = vec![];
 
+        let _guard = create_span_and_active_context("sum textures");
         let output_sums_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Output Sum Buffer"),
             size: (expected_concurrent_instances  * std::mem::size_of::<f32>() as u32) as u64,
@@ -1533,6 +1546,8 @@ impl App{
             mapped_at_creation: false,
         });
 
+
+        let sum_encoder_guard = create_span_and_active_context("sum_encoder");
         let mut command_encoder =
             self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
@@ -1540,6 +1555,7 @@ impl App{
             sumPipeline.add_to_encoder(&mut command_encoder);
             sumPipeline.copy_output_to_buffer(&mut command_encoder, &output_sums_buffer);
         }
+        drop(sum_encoder_guard);
 
         queue.submit(Some(command_encoder.finish()));
         {
@@ -1556,6 +1572,7 @@ impl App{
             }
         }
         output_sums_buffer.unmap();
+        drop(_guard);
 
         return scores;
     }
