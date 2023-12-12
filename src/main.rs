@@ -5,7 +5,9 @@ use std::mem::{MaybeUninit, self};
 use std::process::Output;
 use std::rc::Rc;
 use std::{num::NonZeroU32, future};
-use itertools::multiunzip; 
+use futures_intrusive::buffer;
+use itertools::multiunzip;
+use rayon::array; 
 
 //include arc
 use std::sync::Arc;
@@ -18,7 +20,7 @@ use opentelemetry::trace::Span;
 use opentelemetry_sdk::trace::TracerProvider;
 use rand::Rng;
 use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator, IntoParallelIterator};
-use wgpu::{BindingResource, Texture};
+use wgpu::{BindingResource, Texture, BufferSlice};
 use wgpu::{Features, Limits, BindGroup, Queue, Device, BindGroupLayout, util::DeviceExt, TextureView};
 #[cfg(target_arch = "wasm32")]
 use wgpu_example::utils::output_image_wasm;
@@ -466,11 +468,8 @@ enum OutputBufferSetup {
 impl RenderPipelineInstance {
 
     pub fn new(graphics_processor: &GraphicsProcessor, canvas_dimensions : (usize, usize), instance_setup: InstanceSetup, factory: &RenderPiplineFactory, output_buffer: OutputBufferSetup) -> RenderPipelineInstance {
-        let _render_pipleline_instance_creation_guard = create_span_and_active_context("render_pipeline_instance_creation");
         let device = &graphics_processor.device;
         // create an empty instance buffer
-        let _instance_buffer_creation_guard = create_span_and_active_context("instance_buffer_creation");
-
         let output_buffer = match output_buffer {
             OutputBufferSetup::DefaultOutputBuffer => Some(
                 device.create_buffer(&wgpu::BufferDescriptor {
@@ -503,10 +502,6 @@ impl RenderPipelineInstance {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
-        drop(_instance_buffer_creation_guard);
-
-
-        let _render_target_creation_guard = create_span_and_active_context("render_target_creation");    
         let texture_descriptor = wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {
@@ -523,7 +518,6 @@ impl RenderPipelineInstance {
         };
 
         let render_target = factory.texture_factory.borrow_mut().create_texture(texture_descriptor, device);
-        drop(_render_pipleline_instance_creation_guard);
 
         // create the render bundle
         let mut render_bundle_encoder = device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
@@ -840,21 +834,283 @@ impl ImageSizeContents {
 }
 
 
-struct SumTextureArrayPipeline {
+struct SumArrayOfArrayPipeline {
+    compute_pipeline: wgpu::ComputePipeline,
+    buffers: Vec<Rc<wgpu::Buffer>>,
+    stride: u32,
+    stride_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    array_size: u32,
+    strips: u32,
+}
+
+impl SumArrayOfArrayPipeline {
+    pub fn new(graphicsProcessor: &GraphicsProcessor, buffers_to_sum: Vec<Rc<wgpu::Buffer>>, array_size: u32, stride_size : u32, strips: u32) -> SumArrayOfArrayPipeline {
+        println!("SumArrayOfArrayPipeline::new");
+
+        let device = &graphicsProcessor.device;
+        let queue = &graphicsProcessor.queue;
+
+        let wgsl = include_str!("add_shader_array_block.wgsl");
+        let wgsl = wgsl
+            .replace("${number_of_images}", &buffers_to_sum.len().to_string())
+            .replace("${array_size}", array_size.to_string().as_str())
+            .replace("${strips}", strips.to_string().as_str());
+    
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&wgsl)),
+        });
+
+        let stride_buffer = device.create_buffer_init( &wgpu::util::BufferInitDescriptor {
+            label: Some("stride_buffer"),
+            contents: bytemuck::cast_slice(&[stride_size]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+
+            // create bind group
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: NonZeroU32::new(buffers_to_sum.len() as u32),
+                },
+                // stride size
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("compute_bind_group_layout"),
+        });
+
+        let bind_group = device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::BufferArray(buffers_to_sum.iter().map(|buffer| wgpu::BufferBinding {
+                            buffer: buffer,
+                            offset: 0,
+                            size: None,
+                        }).collect::<Vec<_>>().as_slice()),
+                    },
+                    // stride size
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &stride_buffer,
+                            offset: 0,
+                            size: None,
+                        }),
+                    }
+                ],
+                label: Some("add_shader_array_compute_bind_group")
+            }
+        );
+
+        let compute_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Compute Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("add_shader_array_compute_pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "add",
+        });
+
+        SumArrayOfArrayPipeline {
+            compute_pipeline: pipeline,
+            buffers: buffers_to_sum,
+            stride: stride_size,
+            stride_buffer,
+            bind_group,
+            array_size,
+            strips,
+        }
+    }
+
+    pub fn add_to_encoder(&self, command_encoder: &mut wgpu::CommandEncoder) {
+        let mut cpass = command_encoder.begin_compute_pass(&Default::default());
+        cpass.set_pipeline(&self.compute_pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        // for now summing is done just on one thread
+        cpass.dispatch_workgroups(1, 1, self.buffers.len() as u32);
+    }
+
+    pub fn copy_output_to_buffer(&self, command_encoder: &mut wgpu::CommandEncoder, output_buffers: &Vec<wgpu::Buffer>) {
+        for (output_buffer, internal_buffer) in output_buffers.iter().zip(self.buffers.iter()){
+            command_encoder.copy_buffer_to_buffer(
+                &internal_buffer,
+                0,
+                output_buffer,
+                0,
+                std::mem::size_of::<f32>() as u64 * self.array_size as u64,
+            );
+        }
+    }
+
+    pub fn set_stride(&mut self, stride: u32, queue: &Queue) {
+        self.stride = stride;
+        // update stride buffer too
+        queue.write_buffer(&self.stride_buffer, 0, bytemuck::cast_slice(&[stride]));
+    }
+}
+
+struct TextureToBufferSummedPipeline {
+    compute_pipeline: wgpu::ComputePipeline,
+    input_textures: Vec<Rc<wgpu::Texture>>,
+    output_buffers: Vec<Rc<wgpu::Buffer>>,
+    bind_group: wgpu::BindGroup,
+}
+
+impl  TextureToBufferSummedPipeline {
+    pub fn new(graphics_processor: &GraphicsProcessor, input_textures: Vec<Rc<Texture>>) -> TextureToBufferSummedPipeline {
+        println!("TextureToBufferSummedPipeline::new");
+        let device = &graphics_processor.device;
+        let wgsl = include_str!("texture_to_buffer_sum_shader.wgsl");
+        let wgsl = wgsl.replace("${number_of_images}", &input_textures.len().to_string());
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&wgsl)),
+        });
+
+        println!("created shader module");
+
+        // create bind group
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { 
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: NonZeroU32::new(input_textures.len() as u32),
+                },
+                //output buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: NonZeroU32::new(input_textures.len() as u32),
+                },
+            ],
+            label: Some("compute_bind_group_layout"),
+        });
+
+        let output_buffers = input_textures.iter().map(|_| Rc::new(device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: std::mem::size_of::<f32>() as u64 * input_textures[0].width() as u64 * input_textures[0].height() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        }))).collect_vec();
+
+        let tex_views = input_textures.iter().map(|tex| tex.create_view(&wgpu::TextureViewDescriptor::default())).collect::<Vec<_>>();
+
+        let bind_group = device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureViewArray(&tex_views.iter().collect::<Vec<_>>()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::BufferArray(
+                            output_buffers.iter().map(|buffer| wgpu::BufferBinding {
+                                buffer: buffer,
+                                offset: 0,
+                                size: None,
+                            }).collect::<Vec<_>>().as_slice()
+                        ),
+                    }
+                ],
+                label: Some("compute_bind_group")
+            }
+        );
+
+        let compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Compute Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "main",
+        });
+
+        TextureToBufferSummedPipeline {
+            compute_pipeline: pipeline,
+            input_textures,
+            output_buffers,
+            bind_group,
+        }
+    }
+
+    pub fn add_to_encoder(&self, command_encoder: &mut wgpu::CommandEncoder) {
+        let mut cpass = command_encoder.begin_compute_pass(&Default::default());
+        cpass.set_pipeline(&self.compute_pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        // for now summing is done just on one thread
+        cpass.dispatch_workgroups(self.input_textures[0].width(), self.input_textures[0].height(), self.input_textures.len() as u32);
+    }
+
+}
+
+struct SumTexturePipelineBlocksPipeline {
+    compute_pipeline: wgpu::ComputePipeline,
+    texture_views: Vec<wgpu::TextureView>,
+    output_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    stride_size: u32,
+}
+
+struct SumTexturePipeline {
     compute_pipeline: wgpu::ComputePipeline,
     texture_views: Vec<wgpu::TextureView>,
     output_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
 
-impl SumTextureArrayPipeline {
-    pub fn new(graphicsProcessor: &GraphicsProcessor, texture_views: Vec<wgpu::TextureView>) -> SumTextureArrayPipeline {
+impl SumTexturePipeline {
+    pub fn new(graphicsProcessor: &GraphicsProcessor, texture_views: Vec<TextureView>) -> SumTexturePipeline {
         let device = &graphicsProcessor.device;
         let queue = &graphicsProcessor.queue;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("add_shader_array.wgsl"))),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("add_shader.wgsl"))),
         });
 
             // create bind group
@@ -879,117 +1135,7 @@ impl SumTextureArrayPipeline {
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
-                    count: None,
-                },
-            ],
-            label: Some("compute_bind_group_layout"),
-        });
-
-        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (texture_views.len() * std::mem::size_of::<f32>() )as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let bind_group = device.create_bind_group(
-            &wgpu::BindGroupDescriptor {
-                layout: &bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureViewArray(&texture_views.iter().collect::<Vec<_>>()),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: output_buffer.as_entire_binding(),
-                    }
-                ],
-                label: Some("add_shader_array_compute_bind_group")
-            }
-        );
-
-        let compute_pipeline_layout =
-        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Compute Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
-    
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("add_shader_array_compute_pipeline"),
-            layout: Some(&compute_pipeline_layout),
-            module: &shader,
-            entry_point: "add",
-        });
-
-        SumTextureArrayPipeline {
-            compute_pipeline: pipeline,
-            texture_views,
-            output_buffer,
-            bind_group,
-        }
-    }
-
-    pub fn add_to_encoder(&self, command_encoder: &mut wgpu::CommandEncoder) {
-        let mut cpass = command_encoder.begin_compute_pass(&Default::default());
-        cpass.set_pipeline(&self.compute_pipeline);
-        cpass.set_bind_group(0, &self.bind_group, &[]);
-        // for now summing is done just on one thread
-        cpass.dispatch_workgroups(1, 1, self.texture_views.len() as u32);
-    }
-
-    pub fn copy_output_to_buffer(&self, command_encoder: &mut wgpu::CommandEncoder, output_buffer: &wgpu::Buffer) {
-        command_encoder.copy_buffer_to_buffer(
-            &self.output_buffer,
-            0,
-            output_buffer,
-            0,
-            std::mem::size_of::<f32>() as u64 * self.texture_views.len() as u64,
-        );
-    }
-}
-
-struct SumTexturePipeline<'a> {
-    compute_pipeline: wgpu::ComputePipeline,
-    input_texture: &'a wgpu::Texture,
-    output_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
-}
-
-impl<'a> SumTexturePipeline<'a> {
-    pub fn new(graphicsProcessor: &GraphicsProcessor, input_texture: &'a wgpu::Texture) -> SumTexturePipeline<'a> {
-        let device = &graphicsProcessor.device;
-        let queue = &graphicsProcessor.queue;
-
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("add_shader.wgsl"))),
-        });
-
-            // create bind group
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture { 
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    },
-                    count: None,
-                },
-                //output buffer
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                    count: NonZeroU32::new(texture_views.len() as u32),
                 },
             ],
             label: Some("compute_bind_group_layout"),
@@ -1008,7 +1154,7 @@ impl<'a> SumTexturePipeline<'a> {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&input_texture.create_view(&wgpu::TextureViewDescriptor::default())),
+                        resource: wgpu::BindingResource::TextureViewArray(&texture_views.iter().collect::<Vec<_>>()),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -1037,9 +1183,10 @@ impl<'a> SumTexturePipeline<'a> {
             entry_point: "add",
         });
 
+
         SumTexturePipeline {
             compute_pipeline: pipeline,
-            input_texture,
+            texture_views,
             output_buffer,
             bind_group,
         }
@@ -1049,10 +1196,10 @@ impl<'a> SumTexturePipeline<'a> {
         let mut cpass = command_encoder.begin_compute_pass(&Default::default());
         cpass.set_pipeline(&self.compute_pipeline);
         cpass.set_bind_group(0, &self.bind_group, &[]);
-        // for now summing is done just on one thread
-        cpass.dispatch_workgroups(1, 1, 1);
+        cpass.dispatch_workgroups(1, 1, self.texture_views.len() as u32);
     }
 
+    // so can be read by a staging buffer
     pub fn copy_output_to_buffer(&self, command_encoder: &mut wgpu::CommandEncoder, output_buffer: &wgpu::Buffer) {
         command_encoder.copy_buffer_to_buffer(
             &self.output_buffer,
@@ -1087,12 +1234,18 @@ impl GraphicsProcessorBuilder{
     
     
         // Specify the required features
-        let features = Features::TEXTURE_BINDING_ARRAY | Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING;
+        let features = 
+            Features::TEXTURE_BINDING_ARRAY | 
+            Features::BUFFER_BINDING_ARRAY | 
+            Features::STORAGE_RESOURCE_BINDING_ARRAY | 
+            Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING | 
+            Features::TIMESTAMP_QUERY;
     
         // Specify the limits, including the maximum texture array layer count
         let limits = Limits {
             max_texture_array_layers: 256, // Adjust this based on your needs
             max_sampled_textures_per_shader_stage: 512,
+            max_storage_buffers_per_shader_stage: 256,
             ..Default::default()
         };
 
@@ -1315,6 +1468,116 @@ impl EvolutionEnvironment {
 
 }
 
+struct SumTextureArrayPipeline {
+    compute_pipeline: wgpu::ComputePipeline,
+    texture_views: Vec<wgpu::TextureView>,
+    output_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl SumTextureArrayPipeline {
+    pub fn new(graphicsProcessor: &GraphicsProcessor, texture_views: Vec<wgpu::TextureView>) -> SumTextureArrayPipeline {
+        let device = &graphicsProcessor.device;
+        let queue = &graphicsProcessor.queue;
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("add_shader_array.wgsl"))),
+        });
+
+            // create bind group
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture { 
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: NonZeroU32::new(texture_views.len() as u32),
+                },
+                //output buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("compute_bind_group_layout"),
+        });
+
+        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (texture_views.len() * std::mem::size_of::<f32>() )as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureViewArray(&texture_views.iter().collect::<Vec<_>>()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: output_buffer.as_entire_binding(),
+                    }
+                ],
+                label: Some("add_shader_array_compute_bind_group")
+            }
+        );
+
+        let compute_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Compute Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("add_shader_array_compute_pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "add",
+        });
+
+        SumTextureArrayPipeline {
+            compute_pipeline: pipeline,
+            texture_views,
+            output_buffer,
+            bind_group,
+        }
+    }
+
+    pub fn add_to_encoder(&self, command_encoder: &mut wgpu::CommandEncoder) {
+        let mut cpass = command_encoder.begin_compute_pass(&Default::default());
+        cpass.set_pipeline(&self.compute_pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        // for now summing is done just on one thread
+        cpass.dispatch_workgroups(1, 1, self.texture_views.len() as u32);
+    }
+
+    pub fn copy_output_to_buffer(&self, command_encoder: &mut wgpu::CommandEncoder, output_buffer: &wgpu::Buffer) {
+        command_encoder.copy_buffer_to_buffer(
+            &self.output_buffer,
+            0,
+            output_buffer,
+            0,
+            std::mem::size_of::<f32>() as u64 * self.texture_views.len() as u64,
+        );
+    }
+}
+
 struct App {
     pub graphics_processor: GraphicsProcessor,
     pub images: Vec<Arc<ImageWrapper>>,
@@ -1338,7 +1601,7 @@ impl App{
 
         let render_pipeline_factory = RenderPiplineFactory::new(&graphics_processor, &image_textures, texture_factory.clone());
 
-        let mut render_pipeline_instances = (0..number_of_shapes).map(|_| {
+        let mut render_pipeline_instances = (0..evolution_environment.shape_pool_size).map(|_| {
             RenderPipelineInstance::new(&graphics_processor, canvas_dimensions, InstanceSetup::MaxInstances(evolution_environment.shape_pool_size*2), &render_pipeline_factory, output_buffer_setup)
         }).collect::<Vec<_>>();
 
@@ -1449,7 +1712,6 @@ impl App{
 
         let _guard = create_span_and_active_context("create command buffers");
 
-
         let instances_set = self.evolution_environment.get_unranked_shapes().iter().map(|new_shape| {
             let mut instances = vec![];
             //add shapess
@@ -1464,7 +1726,7 @@ impl App{
        
 
 
-        let (command_buffers, output_texture_views) : (Vec<_>, Vec<_>)  = multiunzip(izip!(instances_set, render_pipelines.iter_mut())
+        let (command_buffers, output_textures) : (Vec<_>, Vec<_>)  = multiunzip(izip!(instances_set, render_pipelines.iter_mut())
             // .collect::<Vec<_>>()
             // .par_iter()
             .map(|(instances, render_pipeline)| {
@@ -1490,13 +1752,11 @@ impl App{
                 // subtractPipeline.copy_output_to_buffer(&mut command_encoder, output_staging_buffer);
                 let output_texture = subtract_pipeline.output_texture;
 
-                let output_texture_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
                 drop(subtract_pipeline_guard);
 
                 drop(command_buffer_guard);
 
-                (command_encoder.finish(), output_texture_view)
+                (command_encoder.finish(), output_texture)
             }));
         drop(_guard);
         {
@@ -1536,9 +1796,23 @@ impl App{
             }
         }
 
-        let mut scores = vec![];
+        let mut scores = self.compute_scores( output_textures).await;
 
         let _guard = create_span_and_active_context("sum textures");
+
+
+        return scores;  
+    }
+
+    async fn compute_scores_simple(&self, texture_to_sum: Vec<Rc<Texture>>) -> Vec<f32> {
+        let mut scores = vec![];
+        let device = &self.graphics_processor.device;
+        let queue = &self.graphics_processor.queue;
+        let target_image = &self.gpu_cache.target_texture;
+        let expected_concurrent_instances = texture_to_sum.len() as u32;
+
+        let sum_encoder_guard = create_span_and_active_context("sum_encoder");
+
         let output_sums_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Output Sum Buffer"),
             size: (expected_concurrent_instances  * std::mem::size_of::<f32>() as u32) as u64,
@@ -1546,10 +1820,10 @@ impl App{
             mapped_at_creation: false,
         });
 
+        let output_texture_views = texture_to_sum.iter().map(|tex| tex.create_view(&wgpu::TextureViewDescriptor::default())).collect::<Vec<_>>();
 
-        let sum_encoder_guard = create_span_and_active_context("sum_encoder");
         let mut command_encoder =
-            self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut sumPipeline = SumTextureArrayPipeline::new(&self.graphics_processor, output_texture_views);
             sumPipeline.add_to_encoder(&mut command_encoder);
@@ -1572,9 +1846,111 @@ impl App{
             }
         }
         output_sums_buffer.unmap();
-        drop(_guard);
 
         return scores;
+    }
+
+    async fn compute_scores(&self, texture_to_sum: Vec<Rc<Texture>>) -> Vec<f32> { 
+        // self.compute_scores_simple(texture_to_sum).await
+        self.compute_scores_paralleised(texture_to_sum).await
+    }
+
+    async fn compute_scores_paralleised(&self, texture_to_sum: Vec<Rc<Texture>>) -> Vec<f32> {
+        let mut scores = vec![];
+        let device = &self.graphics_processor.device;
+        let queue = &self.graphics_processor.queue;
+        let target_image = &self.gpu_cache.target_texture;
+
+
+        let _sum_encoder_guard = create_span_and_active_context("sum_encoder");
+        let mut command_encoder =
+            self.graphics_processor.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+        let output_buffers = {
+            let _convert_texture_to_buffer_guard = create_span_and_active_context("convert_texture_to_buffer");
+            let _command_encoder_guard = create_span_and_active_context("command_encoder");
+
+            let mut texture_to_buffer_summed_pipeline = TextureToBufferSummedPipeline::new(&self.graphics_processor, texture_to_sum);
+
+            texture_to_buffer_summed_pipeline.add_to_encoder(&mut command_encoder);
+
+            texture_to_buffer_summed_pipeline.output_buffers
+        };
+
+
+        let array_size = target_image.width() * target_image.height();
+        let strips = 256;
+
+        // create the buffers to store the result
+        let mut output_sums_buffer = output_buffers.iter().map(|_| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Output Sum Buffer"),
+                size: (array_size  * std::mem::size_of::<f32>() as u32) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        }).collect::<Vec<_>>();
+
+        {
+            let _sum_texture_array_guard = create_span_and_active_context("sum_texture_array");
+            let stride_size = 1;
+
+            let mut sum_texture_array_pipeline = SumArrayOfArrayPipeline::new(&self.graphics_processor, output_buffers.clone(), array_size, stride_size, strips);
+            sum_texture_array_pipeline.add_to_encoder(&mut command_encoder);
+            
+            // copy result to buffer
+            sum_texture_array_pipeline.copy_output_to_buffer(&mut command_encoder, &output_sums_buffer);
+        }
+            
+
+        // extract out the result
+        {
+            let _sum_array_process = create_span_and_active_context("sum_array_process");
+            queue.submit(std::iter::once(command_encoder.finish()));
+            
+            let mut pairs = output_sums_buffer.iter_mut().map(|output_sum_buffer| {
+
+                let buffer_slice = output_sum_buffer.slice(..);
+                let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+                buffer_slice.map_async(wgpu::MapMode::Read, move |r| sender.send(r).unwrap());
+
+                (buffer_slice, receiver)
+            });
+
+            let (buffer_slices, recievers) = pairs.unzip::<_, _, Vec<_>, Vec<_>>();
+
+            let _poll_guard = create_span_and_active_context("poll");
+            device.poll(wgpu::Maintain::Wait);
+            drop(_poll_guard);
+
+            let _waiting_on_reciever = create_span_and_active_context("waiting_on_reciever");
+            for reciever in recievers.iter() {
+                reciever.receive().await.unwrap().unwrap();
+            }
+            drop(_waiting_on_reciever);
+
+            let _extracting_data = create_span_and_active_context("extracting_data");
+            for buffer_slice in buffer_slices.iter() {
+                let mut sum = 0.0;
+
+                {
+                    let view = buffer_slice.get_mapped_range();
+                    let slice: &[f32] = bytemuck::cast_slice(&view);
+                    let strip_size = array_size/strips;
+                    let vals = slice.iter().step_by(strip_size as usize).map(|val| *val).collect_vec();
+                    sum = vals.iter().sum()
+                }
+                scores.push(sum);
+            }
+            drop(_extracting_data);
+
+            for output_sum_buffer in output_sums_buffer {
+                output_sum_buffer.unmap();
+            }
+        }
+
+        return scores;
+
     }
 
     fn create_target_texture(image: &DynamicImage, device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Texture {

@@ -2,15 +2,15 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "type": "lldb",
+            "name": "(Windows) Launch",
+            "type": "cppvsdbg",
             "request": "launch",
-            "name": "Debug",
-            "program": "${fileDirname}/../target/debug/main",
+            "program": "${workspaceRoot}/target/debug/main.exe",
             "args": [],
+            "stopAtEntry": false,
             "cwd": "${workspaceRoot}",
-            "sourceLanguages": [
-                "rust"
-            ]
+            "environment": [],
+            "externalConsole": true
         }
     ]
 }
