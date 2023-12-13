@@ -846,8 +846,6 @@ struct SumArrayOfArrayPipeline {
 
 impl SumArrayOfArrayPipeline {
     pub fn new(graphicsProcessor: &GraphicsProcessor, buffers_to_sum: Vec<Rc<wgpu::Buffer>>, array_size: u32, stride_size : u32, strips: u32) -> SumArrayOfArrayPipeline {
-        println!("SumArrayOfArrayPipeline::new");
-
         let device = &graphicsProcessor.device;
         let queue = &graphicsProcessor.queue;
 
@@ -984,7 +982,6 @@ struct TextureToBufferSummedPipeline {
 
 impl  TextureToBufferSummedPipeline {
     pub fn new(graphics_processor: &GraphicsProcessor, input_textures: Vec<Rc<Texture>>) -> TextureToBufferSummedPipeline {
-        println!("TextureToBufferSummedPipeline::new");
         let device = &graphics_processor.device;
         let wgsl = include_str!("texture_to_buffer_sum_shader.wgsl");
         let wgsl = wgsl.replace("${number_of_images}", &input_textures.len().to_string());
@@ -993,8 +990,6 @@ impl  TextureToBufferSummedPipeline {
             label: None,
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&wgsl)),
         });
-
-        println!("created shader module");
 
         // create bind group
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1419,6 +1414,16 @@ impl EvolutionEnvironment {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.unranked_shapes.clear();
+        self.ranked_shapes.clear();
+    }
+
+    pub fn provide_pool(&mut self, unranked_shapes: Vec<Graphic2D>) {
+        assert_eq!(unranked_shapes.len(), self.shape_pool_size);
+        self.unranked_shapes = unranked_shapes;
+    }
+
     pub fn setup_pool(&mut self) {
         //randomly generate shapes
         self.unranked_shapes = (0..self.shape_pool_size).map(|_| {
@@ -1433,6 +1438,7 @@ impl EvolutionEnvironment {
 
     pub fn rank_shapes(&mut self, scores: &Vec<f32>) {
         //check lengths match
+        assert_eq!(scores.len(), self.shape_pool_size);
         assert_eq!(scores.len(), self.unranked_shapes.len());
 
         //zip scores and shapes together
@@ -1457,12 +1463,21 @@ impl EvolutionEnvironment {
     }
 
     pub fn mutate_shapes_into_unranked_pool(&mut self) {
-        for (_, shape) in self.ranked_shapes.iter() {
-            for _ in 0..self.duplication_factor {
-                let new_shape = self.shaper.mutate_shape(shape);
-                self.unranked_shapes.push(new_shape);
+
+        let mut current_shape_index = 0;
+        let mut duplicated_count = 0;
+        for _ in (0..self.shape_pool_size) {
+            let shape = &self.ranked_shapes[current_shape_index].1;
+            let new_shape = self.shaper.mutate_shape(shape);
+            self.unranked_shapes.push(new_shape);
+
+            duplicated_count += 1;
+            if duplicated_count == self.duplication_factor {
+                duplicated_count = 0;
+                current_shape_index += 1;
             }
         }
+
     }
 
 
@@ -1602,7 +1617,7 @@ impl App{
         let render_pipeline_factory = RenderPiplineFactory::new(&graphics_processor, &image_textures, texture_factory.clone());
 
         let mut render_pipeline_instances = (0..evolution_environment.shape_pool_size).map(|_| {
-            RenderPipelineInstance::new(&graphics_processor, canvas_dimensions, InstanceSetup::MaxInstances(evolution_environment.shape_pool_size*2), &render_pipeline_factory, output_buffer_setup)
+            RenderPipelineInstance::new(&graphics_processor, canvas_dimensions, InstanceSetup::MaxInstances(number_of_shapes), &render_pipeline_factory, output_buffer_setup)
         }).collect::<Vec<_>>();
 
         let gpu_cache = GpuCached {
@@ -1659,7 +1674,45 @@ impl App{
 
     // #[auto_span]
     async fn run(&mut self, _path: Option<String>) {
-        self.evolution_environment.setup_pool();
+        // create a pool of shapes
+        let number_of_shapes = self.evolution_environment.shape_pool_size;
+
+        let mut rng = rand::thread_rng();
+
+        println!("Blurring image");
+        //blur image at multiple sizes
+        let image = &self.target_image.image.image;
+        let mut blurred_images = (0..5).map(|i| {
+            let mut image = image.clone();
+            image
+                .resize(100, 100, image::imageops::FilterType::Gaussian)
+                .blur((i*3) as f32)
+        }).collect::<Vec<_>>();
+
+        // save blurred images to disk
+        for (i, blurred_image) in blurred_images.iter().enumerate() {
+            blurred_image.save(format!("target_image_blurred_{}.png", i)).unwrap();
+        }
+
+        // compute the average colour of all the shapes
+        println!("averaging colours");
+        let mut average_colours = self.images.iter().map(|image| {
+            let mut average_colour = [0.0, 0.0, 0.0];
+            let mut num_of_pixels = 0;
+            for x in 0..image.image.width() {
+                for y in 0..image.image.height() {
+                    let pixel = image.image.get_pixel(x, y);
+                    average_colour[0] += pixel[0] as f32;
+                    average_colour[1] += pixel[1] as f32;
+                    average_colour[2] += pixel[2] as f32;
+                    num_of_pixels += 1;
+                }
+            }
+            average_colour[0] /= num_of_pixels as f32;
+            average_colour[1] /= num_of_pixels as f32;
+            average_colour[2] /= num_of_pixels as f32;
+            average_colour
+        }).collect::<Vec<_>>();
 
         let _guard = create_span_and_active_context("run");
 
@@ -1670,7 +1723,45 @@ impl App{
             let _guard_round = create_span_and_active_context("rounds");
 
             for round in 0..self.rounds {
-                println!("Round: {}", round);
+
+                let shapes = (0..number_of_shapes).map(|_| {
+                    // pick random position
+                    //get random x and y within the bounds of the target
+                    let x = rng.gen_range(0.0..1.0);
+                    let y = rng.gen_range(0.0..1.0);
+    
+                    //get random rotation
+                    let rot = rng.gen_range(0.0..360.0);
+    
+                    //pick new random scale
+                    let scale = rng.gen_range(0.0..1.0);
+    
+                    // pick blurred image
+                    let blurred_image_index = (blurred_images.len() as f64 * scale) as usize;
+                    let blurred_image = &blurred_images[blurred_image_index];
+                    // get the pixel at the position
+                    
+                    let blurred_image_x = (blurred_image.width() as f64 * x) as u32;
+                    let blurred_image_y = (blurred_image.height() as f64 * y) as u32;
+    
+                    let pixel = blurred_image.get_pixel(blurred_image_x, blurred_image_y);
+    
+                    // pick the closest image to that colour
+                    let shape_index = average_colours.iter().enumerate().min_by(|(_, a), (_, b)| {
+                        let a_dist = (a[0] - pixel[0] as f32).powi(2) + (a[1] - pixel[1] as f32).powi(2) + (a[2] - pixel[2] as f32).powi(2);
+                        let b_dist = (b[0] - pixel[0] as f32).powi(2) + (b[1] - pixel[1] as f32).powi(2) + (b[2] - pixel[2] as f32).powi(2);
+                        a_dist.total_cmp(&b_dist)
+                    }).unwrap().0;
+    
+                    // create shape
+                    let shape = Graphic2D::new(x as f32, y as f32, rot, self.images[shape_index].clone(), scale as f32);
+    
+                    let shape = self.evolution_environment.shaper.get_random_shape();
+                    (shape)
+                }).collect::<Vec<_>>(); 
+    
+                self.evolution_environment.provide_pool(shapes);
+
                 let _guard_tmp = create_span_and_active_context("run_round");
                 let scores = self.run_round(_path.clone()).await;
                 drop(_guard_tmp);
@@ -1693,7 +1784,63 @@ impl App{
             println!("Best Shape Score: {}", self.best_shape_score());
             // add best shape to shapes
             self.shapes.push(best_shape);
+
+            self.evolution_environment.clear();
         }
+
+        // save the final image
+        self.save_image_from_shapes(_path).await;
+    }
+
+    async fn save_image_from_shapes(&mut self, _path: Option<String>) {
+        let canvas_dimensions = self.get_canvas_dimensions();
+        let width = canvas_dimensions.0 as u32;
+        let height = canvas_dimensions.1 as u32;
+        let expected_concurrent_instances = self.evolution_environment.get_unranked_shapes().len() as u32;
+        let device = &self.graphics_processor.device;
+        let queue = &self.graphics_processor.queue;
+        let render_pipeline_factory = &self.gpu_cache.render_pipeline_factory;
+        render_pipeline_factory.load_texture_factory(&self.graphics_processor, expected_concurrent_instances, width, height);
+        let texture_subtract_pipeline_factory = &self.gpu_cache.texture_subtract_pipeline_factory;
+        texture_subtract_pipeline_factory.load_texture_factory(&self.graphics_processor, expected_concurrent_instances, width, height);
+        let target_image = &self.gpu_cache.target_texture;
+
+        // construct the image from the shapes
+        let mut instances = vec![];
+        //add shapess
+        instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
+
+        let render_pipleine_instances = &mut self.gpu_cache.render_pipeline_instances;
+        let render_pipeline = &mut self.gpu_cache.render_pipeline_instances[0];
+        render_pipeline.set_instances(queue, &instances);
+        // create the buffer to store the output image in 
+        let output_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Output Buffer"),
+            size: (width * height * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // create the command encoder
+        let mut command_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+        // add to command encoder
+        render_pipeline.output_buffer = Some(output_staging_buffer);
+        render_pipeline.add_to_encoder(&mut command_encoder);
+
+
+        // add to queue
+        queue.submit(Some(command_encoder.finish()));
+
+        // extract the image from the buffer
+        let texture_data = App::get_image_data_from_buffer(render_pipeline.output_buffer.as_mut().unwrap(), canvas_dimensions, device).await;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let _path = _path.clone().unwrap().replace(".png", "_final.png");
+        output_image_native(texture_data.to_vec(), canvas_dimensions, _path);
+        #[cfg(target_arch = "wasm32")]
+        output_image_wasm(texture_data.to_vec(), canvas_dimensions);
+        log::info!("Done.");
     }
 
     async fn run_round(&mut self, _path: Option<String>) -> Vec<f32> {
@@ -1722,11 +1869,7 @@ impl App{
             instances
         }).collect::<Vec<_>>();
 
-        let render_pipelines = &mut self.gpu_cache.render_pipeline_instances;
-       
-
-
-        let (command_buffers, output_textures) : (Vec<_>, Vec<_>)  = multiunzip(izip!(instances_set, render_pipelines.iter_mut())
+        let (command_buffers, output_textures) : (Vec<_>, Vec<_>)  = multiunzip(izip!(instances_set, self.gpu_cache.render_pipeline_instances.iter_mut())
             // .collect::<Vec<_>>()
             // .par_iter()
             .map(|(instances, render_pipeline)| {
@@ -1765,31 +1908,18 @@ impl App{
         }
             
         // now combine those textures and perform the addition operation
-        for (i, render_pipeline) in render_pipelines.iter_mut().enumerate() {
+        for (i, render_pipeline) in self.gpu_cache.render_pipeline_instances.iter().enumerate() {
             match render_pipeline.output_buffer {
-                Some(ref mut output_staging_buffer) => {
-                    let mut texture_data = Vec::<u8>::with_capacity(canvas_dimensions.0 * canvas_dimensions.1 * 4);
+                Some(ref output_staging_buffer) => {
+                    let texture_data = App::get_image_data_from_buffer(output_staging_buffer, canvas_dimensions, device).await;
 
-                    // Time to get our image.
-                    let buffer_slice = output_staging_buffer.slice(..);
-                    let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
-                    buffer_slice.map_async(wgpu::MapMode::Read, move |r| sender.send(r).unwrap());
-                    
-                    device.poll(wgpu::Maintain::Wait);
-                    receiver.receive().await.unwrap().unwrap();
-                    log::info!("Output buffer mapped.");
-                    {
-                        let view = buffer_slice.get_mapped_range();
-                        texture_data.extend_from_slice(&view[..]);
-                    }
-                    log::info!("Image data copied to local.");
-        
                     #[cfg(not(target_arch = "wasm32"))]
                     let _path = _path.clone().unwrap().replace(".png", &format!("{}.png", i));
                     output_image_native(texture_data.to_vec(), canvas_dimensions, _path);
                     #[cfg(target_arch = "wasm32")]
                     output_image_wasm(texture_data.to_vec(), canvas_dimensions);
                     log::info!("Done.");
+
                     output_staging_buffer.unmap();
                 },
                 None => {}
@@ -1802,6 +1932,28 @@ impl App{
 
 
         return scores;  
+    }
+
+    async fn get_image_data_from_buffer(output_staging_buffer: &wgpu::Buffer, canvas_dimensions: (usize, usize), device: &wgpu::Device) -> Vec<u8> {
+        let mut texture_data = Vec::<u8>::with_capacity(canvas_dimensions.0 * canvas_dimensions.1 * 4);
+
+        // Time to get our image.
+        let buffer_slice = output_staging_buffer.slice(..);
+        let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |r| sender.send(r).unwrap());
+        
+        device.poll(wgpu::Maintain::Wait);
+        receiver.receive().await.unwrap().unwrap();
+        log::info!("Output buffer mapped.");
+        {
+            let view = buffer_slice.get_mapped_range();
+            texture_data.extend_from_slice(&view[..]);
+        }
+        log::info!("Image data copied to local.");
+
+        return texture_data;
+
+
     }
 
     async fn compute_scores_simple(&self, texture_to_sum: Vec<Rc<Texture>>) -> Vec<f32> {
@@ -2020,11 +2172,11 @@ struct GpuCached {
 }
 
 async fn run(_path: Option<String>) {
-    let pool_size = 100;
-    let rounds = 5;
-    let number_of_images = 2;
-
-
+    let pool_size = 5;
+    let rounds = 10;
+    let number_of_images = 20;
+    // let output_buffer_setup = OutputBufferSetup::DefaultOutputBuffer;
+    let output_buffer_setup = OutputBufferSetup::NoOutputBuffer;
 
     let mut graphics_processor_builder = GraphicsProcessorBuilder::new();
 
@@ -2054,8 +2206,7 @@ async fn run(_path: Option<String>) {
 
     let evolution_environment = EvolutionEnvironment::new(pool_size, shaper, 2);
 
-    let output_buffer_setup = OutputBufferSetup::DefaultOutputBuffer;
-    let output_buffer_setup = OutputBufferSetup::NoOutputBuffer;
+
 
     let mut app = App::new( 
         graphics_processor_builder.build().await, 
@@ -2066,11 +2217,6 @@ async fn run(_path: Option<String>) {
         number_of_images,
         output_buffer_setup
     );
-
-    let shape1 = Graphic2D::new(0.0, 0.0, 0.0, app.images[1].clone(), 1.0);
-    let shape2 = Graphic2D::new(0.5, 0.0, 30.0, app.images[2].clone(), 1.0);
-    app.add_shapes(vec![shape1, shape2]);
-  
 
     app.run(_path).await;
 
