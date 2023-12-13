@@ -8,6 +8,7 @@ use std::{num::NonZeroU32, future};
 use futures_intrusive::buffer;
 use itertools::multiunzip;
 use rayon::array; 
+use rand_distr::Distribution;
 
 //include arc
 use std::sync::Arc;
@@ -465,6 +466,13 @@ enum OutputBufferSetup {
     NoOutputBuffer,
 }
 
+fn align_row(unpadded_bytes_per_row: u32) -> u32 {
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padding = (align - unpadded_bytes_per_row % align) % align;
+    let padded_bytes_per_row = unpadded_bytes_per_row + padding;
+    padded_bytes_per_row
+}
+
 impl RenderPipelineInstance {
 
     pub fn new(graphics_processor: &GraphicsProcessor, canvas_dimensions : (usize, usize), instance_setup: InstanceSetup, factory: &RenderPiplineFactory, output_buffer: OutputBufferSetup) -> RenderPipelineInstance {
@@ -586,6 +594,8 @@ impl RenderPipelineInstance {
         }
 
         if let Some(output_buffer) = &self.output_buffer {
+            let aligned_bytes_per_row = align_row(4*self.render_target.width());
+
             command_encoder.copy_texture_to_buffer(
                 wgpu::ImageCopyTexture {
                     texture: &self.render_target,
@@ -597,7 +607,7 @@ impl RenderPipelineInstance {
                     buffer: output_buffer,
                     layout: wgpu::ImageDataLayout {
                         offset: 0,
-                        bytes_per_row: Some(4 * self.render_target.width()),
+                        bytes_per_row: Some(aligned_bytes_per_row),
                         rows_per_image: Some(self.render_target.height()),
                     },
                 },
@@ -1206,7 +1216,7 @@ impl SumTexturePipeline {
     }
 }
 
-use image::{GenericImageView, DynamicImage};
+use image::{GenericImageView, DynamicImage, Pixel};
 
 struct GraphicsProcessorBuilder {
     images: Option<Vec<DynamicImage>>,
@@ -1319,15 +1329,15 @@ impl Graphic2D{
         self.x += rng.gen_range(-0.1..0.1);
         self.y += rng.gen_range(-0.1..0.1);
         // clamp if out out bounds
-        self.x = self.x.clamp(0.0, target_image_width as f32);
-        self.y = self.y.clamp(0.0, target_image_height as f32);
+        self.x = self.x.clamp(-1.0, 1.0);
+        self.y = self.y.clamp(-1.0, 1.0);
 
 
         //pick new random rotation
         self.rot = rng.gen_range(0.0..360.0);
 
         //pick new random scale
-        self.scale *= rng.gen_range(-0.1..0.1);
+        self.scale += rng.gen_range(-0.1..=0.1);
         // clamp scale if it is too small or too big
         self.scale = self.scale.clamp(smallest_scale, largest_scale);
 
@@ -1448,8 +1458,8 @@ impl EvolutionEnvironment {
         //add to ranked shapes
         self.ranked_shapes.extend(&mut ranked_shapes);
 
-        //sort shapes based on lowest score
-        self.ranked_shapes.sort_by(|a, b| a.0.total_cmp(&b.0));
+        //sort shapes based on highest score
+        self.ranked_shapes.sort_by(|a, b| b.0.total_cmp(&a.0));
 
         //remove from unranked shapes
         self.unranked_shapes.clear();
@@ -1727,25 +1737,32 @@ impl App{
                 let shapes = (0..number_of_shapes).map(|_| {
                     // pick random position
                     //get random x and y within the bounds of the target
-                    let x = rng.gen_range(0.0..1.0);
-                    let y = rng.gen_range(0.0..1.0);
+                    let x = rng.gen_range(-1.0..=1.0);
+                    let y = rng.gen_range(-1.0..=1.0);
     
                     //get random rotation
                     let rot = rng.gen_range(0.0..360.0);
     
                     //pick new random scale
-                    let scale = rng.gen_range(0.0..1.0);
+                    let scale = rng.gen_range(0.0..=1.0);
     
                     // pick blurred image
                     let blurred_image_index = (blurred_images.len() as f64 * scale) as usize;
                     let blurred_image = &blurred_images[blurred_image_index];
                     // get the pixel at the position
                     
-                    let blurred_image_x = (blurred_image.width() as f64 * x) as u32;
-                    let blurred_image_y = (blurred_image.height() as f64 * y) as u32;
-    
+                    let blurred_image_x = (blurred_image.width() as f64 * (x + 1.0)/2.0) as u32;
+                    let blurred_image_y = (blurred_image.height() as f64 * (1.0 - y)/2.0) as u32;
+
                     let pixel = blurred_image.get_pixel(blurred_image_x, blurred_image_y);
-    
+
+                    // let normal_dist = rand_distr::Normal::new(0.0, 10.0).unwrap();
+                    // for i in 0..3 {
+                    //     let variation = normal_dist.sample(&mut rand::thread_rng());
+                    //     average_colours[blurred_image_index][i] += variation;
+                    // }
+
+                    
                     // pick the closest image to that colour
                     let shape_index = average_colours.iter().enumerate().min_by(|(_, a), (_, b)| {
                         let a_dist = (a[0] - pixel[0] as f32).powi(2) + (a[1] - pixel[1] as f32).powi(2) + (a[2] - pixel[2] as f32).powi(2);
@@ -1755,8 +1772,8 @@ impl App{
     
                     // create shape
                     let shape = Graphic2D::new(x as f32, y as f32, rot, self.images[shape_index].clone(), scale as f32);
-    
-                    let shape = self.evolution_environment.shaper.get_random_shape();
+                    // panic!("Shape: {:?}, pixel {:?}", shape_index, pixel);
+                    // println!("Shape: {:?}, pixel {:?}, blurred_image_index {:?}, x: {:?}, y: {:?}", shape_index, pixel, blurred_image_index, x, y);
                     (shape)
                 }).collect::<Vec<_>>(); 
     
@@ -1777,7 +1794,13 @@ impl App{
                 let _guard_tmp = create_span_and_active_context("mutate_shapes_into_unranked_pool");
                 self.evolution_environment.mutate_shapes_into_unranked_pool();
                 drop(_guard_tmp);
-                
+
+                //debugging 
+                // let best_shape = self.best_shape();
+                // self.shapes.push(best_shape);
+                // let _path = _path.clone().unwrap().replace(".png", &format!("_{}_{}.png", shape_count, round));
+                // self.save_image_from_shapes(Some(_path)).await;
+                // self.shapes.pop();
             }
             // select best shape
             let best_shape = self.best_shape();
@@ -1786,6 +1809,8 @@ impl App{
             self.shapes.push(best_shape);
 
             self.evolution_environment.clear();
+
+            
         }
 
         // save the final image
@@ -1803,20 +1828,18 @@ impl App{
         render_pipeline_factory.load_texture_factory(&self.graphics_processor, expected_concurrent_instances, width, height);
         let texture_subtract_pipeline_factory = &self.gpu_cache.texture_subtract_pipeline_factory;
         texture_subtract_pipeline_factory.load_texture_factory(&self.graphics_processor, expected_concurrent_instances, width, height);
-        let target_image = &self.gpu_cache.target_texture;
 
         // construct the image from the shapes
         let mut instances = vec![];
         //add shapess
         instances.append(&mut self.shapes.iter().map(|shape| shape.create_instance().fix_scale(self.get_canvas_dimensions())).collect::<Vec<_>>());
 
-        let render_pipleine_instances = &mut self.gpu_cache.render_pipeline_instances;
         let render_pipeline = &mut self.gpu_cache.render_pipeline_instances[0];
         render_pipeline.set_instances(queue, &instances);
         // create the buffer to store the output image in 
         let output_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Output Buffer"),
-            size: (width * height * 4) as u64,
+            size: (align_row(width*4) * height) as u64,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1841,6 +1864,9 @@ impl App{
         #[cfg(target_arch = "wasm32")]
         output_image_wasm(texture_data.to_vec(), canvas_dimensions);
         log::info!("Done.");
+
+        render_pipeline.output_buffer.as_ref().unwrap().unmap();
+        render_pipeline.output_buffer = None;
     }
 
     async fn run_round(&mut self, _path: Option<String>) -> Vec<f32> {
@@ -1946,7 +1972,16 @@ impl App{
         receiver.receive().await.unwrap().unwrap();
         log::info!("Output buffer mapped.");
         {
-            let view = buffer_slice.get_mapped_range();
+            let unpadded_bytes_per_row = canvas_dimensions.0 as u32 * 4;
+            let padded_bytes_per_row = align_row(unpadded_bytes_per_row);
+            let view_padded = buffer_slice.get_mapped_range();
+            let view = view_padded
+                .chunks(padded_bytes_per_row as _)
+                .map(|chunk| { &chunk[..unpadded_bytes_per_row as _]})
+                .flatten()
+                .map(|x| { *x })
+                .collect::<Vec<_>>();
+
             texture_data.extend_from_slice(&view[..]);
         }
         log::info!("Image data copied to local.");
@@ -2003,8 +2038,8 @@ impl App{
     }
 
     async fn compute_scores(&self, texture_to_sum: Vec<Rc<Texture>>) -> Vec<f32> { 
-        // self.compute_scores_simple(texture_to_sum).await
-        self.compute_scores_paralleised(texture_to_sum).await
+        self.compute_scores_simple(texture_to_sum).await
+        // self.compute_scores_paralleised(texture_to_sum).await
     }
 
     async fn compute_scores_paralleised(&self, texture_to_sum: Vec<Rc<Texture>>) -> Vec<f32> {
@@ -2172,25 +2207,29 @@ struct GpuCached {
 }
 
 async fn run(_path: Option<String>) {
-    let pool_size = 5;
-    let rounds = 10;
-    let number_of_images = 20;
+    let pool_size = 20;
+    let rounds = 20;
+    let number_of_images = 10;
+    let duplication_factor = 5;
     // let output_buffer_setup = OutputBufferSetup::DefaultOutputBuffer;
     let output_buffer_setup = OutputBufferSetup::NoOutputBuffer;
+    let width_of_target_image = 256;
+    let target_image_path = "./assets/targets/tri-color.png";
+    let source_image_folder = "./assets/sources/simple";
 
     let mut graphics_processor_builder = GraphicsProcessorBuilder::new();
 
     let target_image_image = Arc::new(ImageWrapper {
-        image: image::open("./assets/targets/grapes.jpg").unwrap(),
+        image: image::open(target_image_path)
+            .unwrap()
+            .resize(width_of_target_image, width_of_target_image, image::imageops::FilterType::Gaussian),
         texture_id: 0,
     });
 
     let target_image = Graphic2D::new(0.0, 0.0, 0.0, target_image_image.clone(), 2.0);
 
     let mut images = vec![];
-    images.push(target_image_image.clone());
-
-    images.append(&mut App::load_images("./assets/sources/minecraft".to_string(), 1));
+    images.append(&mut App::load_images(source_image_folder.to_string(), 0));
 
     let image_textures = images.iter().map(|image| image.image.clone()).collect::<Vec<_>>();
 
@@ -2198,13 +2237,14 @@ async fn run(_path: Option<String>) {
 
     let shaper = Shaper {
         source_images: images.clone(),
-        largest_scale: 1.3,
+        largest_scale: 2.0,
         smallest_scale: 0.1,
         target_image_width: target_image.image.image.width(),
         target_image_height: target_image.image.image.height(),
     };
 
-    let evolution_environment = EvolutionEnvironment::new(pool_size, shaper, 2);
+    let evolution_environment = EvolutionEnvironment::new(pool_size, shaper, duplication_factor);
+
 
 
 

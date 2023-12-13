@@ -24,6 +24,7 @@ opentelemetry_sdk = { version = "0.21.1" , features = ["logs", "trace"]}
 png = "0.17.10"
 pollster = "0.3.0"
 rand = "0.8.5"
+rand_distr = "0.4.3"
 rayon = "1.8.0"
 wgpu = "0.18.0"
 
